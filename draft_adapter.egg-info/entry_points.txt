@@ -1,2 +1,0 @@
-[console_scripts]
-draft-adapter = draft_adapter.cli:main
