@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "draft-adapter"
+version = "0.1.0"
+description = "Turn standard LLMs into vLLM-compatible draft models for speculative decoding"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Frank", email = "frank@example.com"},
+]
+keywords = ["llm", "speculative-decoding", "draft-model", "model-compression", "vllm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "accelerate>=0.33.0",
+    "datasets>=3.0.0",
+    "tqdm>=4.66",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+bench = [
+    "vllm>=0.6.0",
+]
+int4 = [
+    "bitsandbytes>=0.44.0",
+]
+
+[project.scripts]
+draft-adapter = "draft_adapter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["draft_adapter*"]
