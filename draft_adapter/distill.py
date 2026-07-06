@@ -37,7 +37,7 @@ class DistillationTrainer:
 
         self.optimizer = torch.optim.AdamW(
             self.student.parameters(), lr=config.learning_rate)
-        self.scheduler = None  # set in train() when total steps known
+        self.scheduler = None
 
     # ---- Loss functions ----
 
@@ -74,14 +74,14 @@ class DistillationTrainer:
             kl = 0.5 * (t_probs - s_probs).abs().sum(dim=-1)
         return kl.mean()
 
-    # ---- Teacher forward (no grad) ----
-
+    # ---- Teacher forward (no grad, compiled) ----
     @torch.no_grad()
     def _teacher_forward(self, input_ids: Tensor) -> Tensor:
-        return self.teacher(
+        out = self.teacher(
             input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-        ).logits.detach()
+            attention_mask=torch.ones_like(input_ids, device=input_ids.device),
+        )
+        return out.logits.detach()
 
     # ---- Phase 1: Off-policy recovery (teacher generates, student imitates) ----
 
@@ -99,23 +99,28 @@ class DistillationTrainer:
         )
         full_ids = teacher_gen[:, :prompt_ids.shape[1] + gen_len]
 
-        # Teacher computes logits
-        teacher_logits = self._teacher_forward(full_ids)
-
         # Student forward
         student_out = self.student(
             input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids),
+            attention_mask=torch.ones_like(full_ids, device=full_ids.device),
         )
         student_logits = student_out.logits
 
-        # Align: predict next token
-        min_len = min(teacher_logits.shape[1], student_logits.shape[1])
-        t_logits = teacher_logits[:, prompt_ids.shape[1]-1:min_len-1, :]
-        s_logits = student_logits[:, prompt_ids.shape[1]-1:min_len-1, :]
+        # CE loss: predict teacher's next token at each position
+        # Only on the generated portion (after prompt)
+        labels = full_ids[:, 1:].contiguous()  # [batch, seq-1]
+        s_logits = student_logits[:, :-1, :].contiguous()  # [batch, seq-1, vocab]
 
-        # Full-vocab KL for stable recovery
-        loss = self.full_kl(s_logits, t_logits, T=self.config.kl_temperature)
+        # Mask: only compute loss on generated tokens (after prompt)
+        prompt_len = prompt_ids.shape[1]
+        gen_mask = torch.zeros(labels.shape, device=labels.device)
+        gen_mask[:, max(0, prompt_len - 1):] = 1.0
+        loss = F.cross_entropy(
+            s_logits.reshape(-1, s_logits.shape[-1]),
+            labels.reshape(-1),
+            reduction="none",
+        ).view(labels.shape)
+        loss = (loss * gen_mask).sum() / gen_mask.sum().clamp(min=1)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -147,12 +152,8 @@ class DistillationTrainer:
         # Teacher scores student's tokens
         teacher_logits = self._teacher_forward(full_ids)
 
-        # Student forward
-        student_out = self.student(
-            input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids),
-        )
-        student_logits = student_out.logits
+        # Student forward (compiled if available)
+        student_logits = self._student_logits(full_ids)
 
         min_len = min(teacher_logits.shape[1], student_logits.shape[1])
         t_logits = teacher_logits[:, prompt_ids.shape[1]-1:min_len-1, :]
