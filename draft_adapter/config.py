@@ -68,10 +68,10 @@ class DistillConfig:
         generate_len: Number of tokens student generates per step.
     """
 
-    steps: int = 1000
+    steps: int = 4000
     batch_size: int = 4
     max_seq_len: int = 512
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-5
     top_k: int = 10
     kl_temperature: float = 1.0
     kl_mode: str = "reverse"
