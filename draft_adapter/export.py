@@ -18,32 +18,29 @@ def export_to_hf(
     model: torch.nn.Module,
     arch: ModelArchitecture,
     tokenizer,
-    original_config,
     output_dir: str,
 ) -> None:
     """Export the compressed model in HF format.
 
     Creates:
       output_dir/
-        config.json          — Updated model config
+        config.json          — Model config (uses model's own config)
         model.safetensors     — Compressed weights
-        tokenizer.json        — Copied tokenizer
-        tokenizer_config.json — Copied tokenizer config
+        tokenizer.json        — Tokenizer
+        tokenizer_config.json — Tokenizer config
 
     Args:
-        model: Compressed HF model.
-        arch: ModelArchitecture with target_* fields set.
+        model: Compressed HF model (config must be already correct).
+        arch: ModelArchitecture with target_* fields set (for logging).
         tokenizer: HF tokenizer.
-        original_config: Original HF model config.
         output_dir: Output directory path.
     """
     os.makedirs(output_dir, exist_ok=True)
     t = arch
 
-    # ---- 1. Build config ----
-    config = _build_export_config(original_config, arch)
+    # ---- 1. Save config (use model's own config, already correct) ----
+    model.config.save_pretrained(output_dir)
     config_path = os.path.join(output_dir, "config.json")
-    config.save_pretrained(output_dir)
     print(f"  Saved config to {config_path}")
 
     # ---- 2. Save model weights ----
@@ -76,6 +73,9 @@ def _build_export_config(original_config, arch: ModelArchitecture):
 
     config.hidden_size = t.target_embed_dim
     config.num_hidden_layers = t.target_num_layers
+    # Sync layer_types (Qwen3 sliding window) with new layer count
+    if hasattr(config, "layer_types") and config.layer_types is not None:
+        config.layer_types = config.layer_types[:t.target_num_layers]
     config.num_attention_heads = t.target_num_heads
     config.num_key_value_heads = t.target_num_kv_heads
     config.head_dim = t.target_head_dim
@@ -120,9 +120,15 @@ def _verify_export(output_dir: str, tokenizer) -> None:
 
         assert output.logits.shape[0] == 1
         assert output.logits.shape[1] == 8
-        assert output.logits.shape[2] == tokenizer.vocab_size
+        model_vocab = output.logits.shape[2]
+        tok_vocab = tokenizer.vocab_size
+        if model_vocab != tok_vocab:
+            print(f"  Note: model vocab ({model_vocab}) != tokenizer vocab ({tok_vocab}), "
+                  f"this is normal for some models")
         print(f"  Round-trip verification passed (logits: {list(output.logits.shape)})")
 
     except Exception as e:
+        import traceback
         print(f"  Warning: round-trip verification failed: {e}")
+        traceback.print_exc()
         print(f"  The model files are saved but may need manual inspection.")

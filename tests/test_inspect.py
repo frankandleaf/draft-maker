@@ -47,6 +47,7 @@ class TestModelArchitecture:
 
 class TestComputeTargets:
     def test_basic_scaling(self):
+        """head_dim is FROZEN — only num_heads reduces."""
         arch = ModelArchitecture(
             model_type="qwen3",
             num_layers=24,
@@ -62,19 +63,22 @@ class TestComputeTargets:
         )
 
         width = WidthConfig(
-            head_dim_factor=0.5,   # 128 -> 64
-            head_size_factor=0.5,  # 16 -> 8, kv=4->2
-            embed_size_factor=0.5, # 2048 -> 1024... but will be adjusted
+            head_dim_factor=0.5,   # IGNORED: head_dim is frozen
+            head_size_factor=0.5,  # IGNORED: num_heads derived from embed_dim
+            embed_size_factor=0.5, # 2048 -> 1024
         )
         depth = DepthConfig(layer_factor=0.5)  # 24 -> 12
 
         result = compute_targets(arch, width, depth)
 
-        assert result.target_head_dim == 64   # 128 * 0.5
-        assert result.target_num_heads == 8    # 16 * 0.5
-        assert result.target_num_kv_heads == 2  # 4 * 0.5
-        # embed_dim = num_heads * head_dim = 8 * 64 = 512
-        assert result.target_embed_dim == 512
+        # head_dim frozen at 128
+        assert result.target_head_dim == 128
+        # embed_dim = 2048 * 0.5 = 1024, rounded to multiple of 128
+        assert result.target_embed_dim == 1024
+        # num_heads = embed_dim / head_dim = 1024 / 128 = 8
+        assert result.target_num_heads == 8
+        # num_kv_heads = num_heads / kv_groups = 8 / 4 = 2
+        assert result.target_num_kv_heads == 2
         assert result.target_num_layers == 12
 
     def test_gqa_invariant_maintained(self):
@@ -100,6 +104,7 @@ class TestComputeTargets:
         assert result.target_num_heads % result.target_num_kv_heads == 0
 
     def test_embed_dim_matches_heads_times_head_dim(self):
+        """head_dim frozen, embed_dim = num_heads * head_dim."""
         arch = ModelArchitecture(
             model_type="qwen2",
             num_layers=28,
@@ -114,10 +119,14 @@ class TestComputeTargets:
             tie_word_embeddings=False,
         )
 
-        width = WidthConfig(head_dim_factor=0.75, head_size_factor=0.5, embed_size_factor=0.3)
+        width = WidthConfig(embed_size_factor=0.5)
         depth = DepthConfig(layer_factor=0.5)
 
         result = compute_targets(arch, width, depth)
+        # head_dim frozen at 128
+        assert result.target_head_dim == 128
+        # embed_dim = 3584 * 0.5 = 1792, rounded to multiple of 128 = 1792
+        # num_heads = 1792 / 128 = 14
         assert result.target_num_heads * result.target_head_dim == result.target_embed_dim
 
     def test_min_layers_protected(self):

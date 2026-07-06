@@ -37,9 +37,9 @@ def format_param_count(count: int) -> str:
 
 def load_calibration_data(tokenizer, num_samples: int = 16,
                           seq_len: int = 512, device: str = "cuda") -> Tensor:
-    """Load calibration text from C4 and tokenize.
+    """Load calibration text from wikitext and tokenize.
 
-    Falls back to random tokens if dataset download fails.
+    Tries wikitext → C4 → random fallback.
 
     Args:
         tokenizer: HF tokenizer.
@@ -51,30 +51,48 @@ def load_calibration_data(tokenizer, num_samples: int = 16,
         input_ids tensor of shape [num_samples, seq_len].
     """
     input_ids_list = []
-    try:
-        dataset = load_dataset("c4", "en", split="train", streaming=True)
-        for i, example in enumerate(dataset):
-            if i >= num_samples:
-                break
-            tokens = tokenizer(
-                example["text"],
-                truncation=True,
-                max_length=seq_len,
-                return_tensors="pt",
-            )
-            ids = tokens.input_ids[0]
-            if ids.shape[0] < seq_len:
-                ids = torch.nn.functional.pad(ids, (0, seq_len - ids.shape[0]), value=tokenizer.pad_token_id or 0)
-            input_ids_list.append(ids[:seq_len])
-    except Exception:
-        # Fallback: random token IDs
-        for _ in range(num_samples):
-            ids = torch.randint(0, tokenizer.vocab_size, (seq_len,))
-            input_ids_list.append(ids)
 
+    # Try bilingual sources: Chinese first for Qwen models, then English fallback
+    dataset_sources = [
+        ("allenai/c4-zh", lambda: load_dataset(
+            "allenai/c4", "zh", split="train", streaming=True)),
+        ("allenai/c4-en", lambda: load_dataset(
+            "allenai/c4", "en", split="train", streaming=True)),
+        ("wikitext", lambda: load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="train", streaming=True)),
+    ]
+
+    for name, loader in dataset_sources:
+        try:
+            ds = loader()
+            for i, example in enumerate(ds):
+                if i >= num_samples:
+                    break
+                text = example.get("text", example.get("content", ""))
+                if not text or len(text.strip()) < 20:
+                    continue
+                tokens = tokenizer(
+                    text, truncation=True, max_length=seq_len,
+                    return_tensors="pt",
+                )
+                ids = tokens.input_ids[0]
+                if ids.shape[0] < seq_len:
+                    ids = torch.nn.functional.pad(
+                        ids, (0, seq_len - ids.shape[0]),
+                        value=tokenizer.pad_token_id or 0)
+                input_ids_list.append(ids[:seq_len])
+            if input_ids_list:
+                print(f"  Calibration data: {name} ({len(input_ids_list)} samples)")
+                break
+        except Exception as e:
+            print(f"  Dataset '{name}' failed: {e}")
+
+    # Fallback: random tokens (worst case, PCA will be meaningless)
     if not input_ids_list:
+        print("  WARNING: All datasets failed, using random tokens (model quality will suffer!)")
         for _ in range(num_samples):
-            input_ids_list.append(torch.randint(0, tokenizer.vocab_size, (seq_len,)))
+            input_ids_list.append(
+                torch.randint(0, tokenizer.vocab_size, (seq_len,)))
 
     return torch.stack(input_ids_list).to(device)
 

@@ -127,59 +127,37 @@ def compute_targets(arch: ModelArchitecture,
 
     Returns:
         ModelArchitecture with target_* fields populated.
+        head_dim is FROZEN — changing it breaks RoPE position encoding.
+        Width reduction is absorbed entirely by num_heads reduction.
     """
-    # Stage 1: Naive scaling
-    target_embed_dim = max(8, int(arch.hidden_size * width.embed_size_factor))
-    target_head_dim = max(1, int(arch.head_dim * width.head_dim_factor))
-    target_num_heads = max(1, int(arch.num_attention_heads * width.head_size_factor))
+    # Stage 1: head_dim is FROZEN (RoPE depends on it)
+    target_head_dim = arch.head_dim
+
+    # Stage 2: Scale embed_dim, then derive num_heads from it
+    target_embed_dim = max(target_head_dim, int(arch.hidden_size * width.embed_size_factor))
+    # Make embed_dim a multiple of head_dim
+    target_embed_dim = (target_embed_dim // target_head_dim) * target_head_dim
+    target_num_heads = target_embed_dim // target_head_dim
+
+    # Stage 3: Scale intermediate_size and num_layers
     target_intermediate_size = max(8, int(arch.intermediate_size * width.embed_size_factor))
     target_num_layers = max(1, int(arch.num_layers * depth.layer_factor))
 
-    # Stage 2: Ensure head_dim divides embed_dim
-    # target_embed_dim must be a multiple of target_head_dim
-    # and should equal target_num_heads * target_head_dim
-    expected_embed = target_num_heads * target_head_dim
-    if expected_embed != target_embed_dim:
-        # Adjust embed_dim to match num_heads * head_dim
-        target_embed_dim = expected_embed
-
-    # Stage 3: Enforce GQA invariant (num_heads % num_kv_heads == 0)
+    # Stage 4: Enforce GQA invariant (num_heads % num_kv_heads == 0)
     kv_groups = arch.num_attention_heads // arch.num_kv_heads
-    target_num_kv_heads = max(1, int(arch.num_kv_heads * width.head_size_factor))
+    # Scale num_kv_heads proportionally to num_heads
+    target_num_kv_heads = max(1, target_num_heads // kv_groups)
 
-    # Ensure target_num_kv_heads is a divisor of target_num_heads
-    # Approach: keep num_kv_heads, adjust num_heads if needed
-    if target_num_kv_heads < 1:
-        target_num_kv_heads = 1
+    # Ensure target_num_heads is a multiple of target_num_kv_heads
+    if target_num_heads % target_num_kv_heads != 0:
+        target_num_heads = (target_num_heads // target_num_kv_heads) * target_num_kv_heads
+        target_embed_dim = target_num_heads * target_head_dim
 
-    # target_num_heads should be a multiple of target_num_kv_heads
-    # with the same kv_groups ratio as original
-    if kv_groups > 1:
-        # Try to preserve the original GQA ratio
-        target_num_heads_from_kv = target_num_kv_heads * kv_groups
-        if abs(target_num_heads_from_kv - target_num_heads) <= abs(expected_embed - target_embed_dim) // target_head_dim:
-            target_num_heads = target_num_heads_from_kv
-        else:
-            # Adjust num_heads to be divisible by kv_groups
-            target_num_heads = (target_num_heads // kv_groups) * kv_groups
-            if target_num_heads < target_num_kv_heads:
-                target_num_heads = target_num_kv_heads * kv_groups
-
-    # Final: recompute embed_dim to be exactly num_heads * head_dim
-    target_embed_dim = target_num_heads * target_head_dim
-
-    # Stage 4: Ensure at least protect_first + protect_last layers remain
+    # Stage 5: Ensure at least protect_first + protect_last layers remain
     min_layers = depth.protect_first + depth.protect_last
     target_num_layers = max(target_num_layers, min_layers)
 
-    # Stage 5: Validate
-    if target_num_heads % target_num_kv_heads != 0:
-        # Force fix: set num_heads to nearest multiple
-        target_num_heads = (target_num_heads // target_num_kv_heads) * target_num_kv_heads
-        if target_num_heads < target_num_kv_heads:
-            target_num_heads = target_num_kv_heads
-        target_embed_dim = target_num_heads * target_head_dim
-
+    # Stage 6: Validate
     assert target_num_heads * target_head_dim == target_embed_dim, \
         f"Attention dim mismatch: {target_num_heads} * {target_head_dim} != {target_embed_dim}"
     assert target_num_heads % target_num_kv_heads == 0, \

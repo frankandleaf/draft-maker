@@ -5,17 +5,20 @@ from dataclasses import dataclass, field
 
 @dataclass
 class WidthConfig:
-    """Width compression factors (all 0.0–1.0 multipliers).
+    """Width compression factors (0.0–1.0 multipliers).
+
+    head_dim is FROZEN — changing it breaks RoPE position encoding.
+    Width reduction is absorbed entirely by num_heads.
 
     Attributes:
-        head_dim_factor: Scales head_dim. Range (0, 1].
-        head_size_factor: Scales num_heads (and num_kv_heads for GQA). Range (0, 1].
-        embed_size_factor: Scales hidden_size / embed_dim. Range (0, 1].
+        head_dim_factor: (DEPRECATED, kept for CLI compat) Ignored.
+        head_size_factor: Scales num_heads (and num_kv_heads for GQA).
+        embed_size_factor: Scales hidden_size / embed_dim.
         calibration_samples: Number of calibration sequences for PCA.
         calibration_seq_len: Max tokens per calibration sequence.
     """
 
-    head_dim_factor: float = 0.5
+    head_dim_factor: float = 0.5   # DEPRECATED: head_dim is frozen
     head_size_factor: float = 0.5
     embed_size_factor: float = 0.5
     calibration_samples: int = 16
@@ -111,6 +114,7 @@ class PipelineConfig:
     distill: DistillConfig | None = None
     skip_distill: bool = False
     skip_benchmark: bool = False
+    debug: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:

@@ -12,6 +12,7 @@ from torch import Tensor
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from .calibration import collect_layer_outputs
+from .debug_log import get_logger
 from .inspect import ModelArchitecture
 
 
@@ -85,6 +86,17 @@ class DepthPruner:
             bi_scores.append(score)
 
         self.bi_scores = bi_scores
+
+        log = get_logger()
+        log.section("ShortGPT BI Scores")
+        for i, s in enumerate(bi_scores):
+            bar = "█" * max(1, int(s * 50))
+            log.info(f"L{i:2d}: {s:.4f} {bar}")
+        log.info(f"Most important: L{max(range(len(bi_scores)), key=lambda i: bi_scores[i])} "
+                 f"(BI={max(bi_scores):.4f})")
+        log.info(f"Most redundant:  L{min(range(len(bi_scores)), key=lambda i: bi_scores[i])} "
+                 f"(BI={min(bi_scores):.4f})")
+
         return bi_scores
 
     def _compute_pair_bi(self, outputs_a: list[Tensor],
@@ -158,6 +170,17 @@ class DepthPruner:
 
         # Combine and sort
         kept = sorted(list(protected) + kept_middle)
+        removed = [i for i in range(num_layers) if i not in kept]
+
+        log = get_logger()
+        log.section("Layer Selection")
+        log.info(f"Target: {target_count} layers (from {num_layers})")
+        log.info(f"Protected first: {sorted(protected)[:self.protect_first]}")
+        log.info(f"Protected last:  {sorted(protected)[-self.protect_last:]}")
+        log.info(f"Kept ({len(kept)}):   {kept}")
+        log.info(f"Removed ({len(removed)}): {removed}")
+        if kept_middle:
+            log.info(f"Top BI selected: {kept_middle[:5]}")
 
         return kept
 
@@ -179,6 +202,12 @@ class DepthPruner:
         # Create config with reduced layer count
         pruned_config = copy.deepcopy(original_config)
         pruned_config.num_hidden_layers = len(keep_indices)
+
+        # Sync layer_types (Qwen3 sliding window config) with kept layer indices
+        if hasattr(pruned_config, "layer_types") and pruned_config.layer_types is not None:
+            pruned_config.layer_types = [
+                pruned_config.layer_types[i] for i in keep_indices
+            ]
 
         # Instantiate new model
         pruned_model = AutoModelForCausalLM.from_config(
@@ -207,6 +236,8 @@ class DepthPruner:
             "self_attn.k_proj",
             "self_attn.v_proj",
             "self_attn.o_proj",
+            "self_attn.q_norm",
+            "self_attn.k_norm",
             "mlp.gate_proj",
             "mlp.up_proj",
             "mlp.down_proj",

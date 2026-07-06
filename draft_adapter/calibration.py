@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from .debug_log import get_logger
 from .utils import load_calibration_data
 
 
@@ -141,5 +142,13 @@ def compute_global_covariance(model, input_ids: Tensor,
         for layer_idx in range(len(layer_outputs)):
             for batch_output in layer_outputs[layer_idx]:
                 aggregator.update(batch_output)
+
+    log = get_logger()
+    log.section("Covariance Aggregation Complete")
+    log.info(f"Tokens accumulated: {aggregator.count}")
+    log.info(f"Matrix shape: {aggregator.C.shape}")
+    log.info(f"Trace: {aggregator.C.trace().item():.2f}")
+    log.info(f"Condition number estimate: "
+             f"{torch.linalg.cond(aggregator.compute()).item():.1f}")
 
     return aggregator

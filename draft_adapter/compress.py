@@ -7,22 +7,19 @@ Key insight from the SliceGPT paper (ICLR 2024):
 
 Weight projection rules (critical for mathematical correctness):
 
-  Rule "both":  Square matrices [d,d] where both sides touch residual stream.
-                e.g. q_proj, o_proj.
-                W_new = Q_top.T @ W @ Q_top  ->  [d', d']
+  Rule "input":  Weights where INPUT is residual stream (d)
+                but OUTPUT is NOT (q_proj, k_proj, v_proj, gate_proj, up_proj).
+                W_new = W @ Q_top  →  [out, d']  then slice out-dim
 
-  Rule "input": Weights where the INPUT dimension is residual stream (d)
-                but OUTPUT is NOT (e.g., k_proj, v_proj, gate_proj, up_proj).
-                W_new = W @ Q_top  ->  [out, d'] then slice output dim
-
-  Rule "output": Weights where the OUTPUT dimension is residual stream (d)
-                 but INPUT is NOT (e.g., down_proj).
-                 W_new = Q_top.T @ W  ->  [d', in] then slice input dim
+  Rule "output": Weights where OUTPUT is residual stream (d)
+                 but INPUT is NOT (o_proj, down_proj).
+                 W_new = Q_top.T @ W  →  [d', in]  then slice in-dim
 
   Rule "embed":  Embedding/lm_head weights [V, d].
                  W_new = W @ Q_top  ->  [V, d']
 
   Rule "norm":   RMSNorm weights [d]. Slice to [d'].
+  Rule "head_norm": Q/K norm weights [head_dim]. Slice to [target_head_dim].
 """
 
 import copy
@@ -34,8 +31,71 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from .calibration import CovarianceAggregator
+from .debug_log import get_logger
 from .inspect import ModelArchitecture
 from .utils import get_dtype
+
+
+# --- Norm absorption (MUST happen before PCA projection) ---
+
+
+def _absorb_norms(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+    """Fuse RMSNorm gamma weights into adjacent Linear layer weights.
+
+    Why: matrix multiplication Q^T @ (X * gamma) cannot be expressed as
+    (Q^T @ X) * gamma' for any element-wise gamma'.  The only correct
+    approach is to absorb gamma into the adjacent weight matrices BEFORE
+    projection, reducing the RMSNorm to a pure scaling-free normalizer
+    (gamma = 1), which IS orthogonally invariant.
+
+    Absorption rules:
+      input_layernorm[i]  →  q_proj[i], k_proj[i], v_proj[i]
+      post_attn_norm[i]   →  gate_proj[i], up_proj[i]
+      model.norm          →  lm_head
+
+    After absorption, all norm weights become ones.
+    """
+    sd = {k: v.clone() for k, v in state_dict.items()}
+    log = get_logger()
+
+    log.section("Norm Absorption: fusing RMSNorm γ → adjacent Linear weights")
+    log.info(f"Processing {num_layers} layers + global norm")
+
+    for i in range(num_layers):
+        prefix = f"model.layers.{i}"
+
+        # input_layernorm → q_proj, k_proj, v_proj
+        in_ln_key = f"{prefix}.input_layernorm.weight"
+        if in_ln_key in sd:
+            gamma = sd[in_ln_key]
+            log.before(f"L{i} input_layernorm → q/k/v",
+                       gamma_norm=gamma.float().norm(), gamma_len=gamma.shape[0])
+            for proj in ["q_proj", "k_proj", "v_proj"]:
+                w_key = f"{prefix}.self_attn.{proj}.weight"
+                if w_key in sd:
+                    w_before = sd[w_key].clone()
+                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
+                    log.weight_diff(f"L{i}.{proj}", w_before, sd[w_key])
+            sd[in_ln_key] = torch.ones_like(gamma)
+            log.info("  → γ set to ones")
+
+        # post_attention_layernorm → gate_proj, up_proj
+        post_ln_key = f"{prefix}.post_attention_layernorm.weight"
+        if post_ln_key in sd:
+            gamma = sd[post_ln_key]
+            for proj in ["gate_proj", "up_proj"]:
+                w_key = f"{prefix}.mlp.{proj}.weight"
+                if w_key in sd:
+                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
+            sd[post_ln_key] = torch.ones_like(gamma)
+
+    # model.norm → lm_head
+    if "model.norm.weight" in sd and "lm_head.weight" in sd:
+        gamma = sd["model.norm.weight"]
+        sd["lm_head.weight"] = sd["lm_head.weight"] * gamma.unsqueeze(0)
+        sd["model.norm.weight"] = torch.ones_like(gamma)
+
+    return sd
 
 
 # --- State dict key patterns and their projection rules ---
@@ -43,17 +103,19 @@ from .utils import get_dtype
 # Each entry: (key_suffix_pattern, projection_rule)
 # Rules: "both" | "input" | "output" | "embed" | "norm" | "skip"
 LAYER_WEIGHT_RULES = [
-    ("self_attn.q_proj.weight", "both"),
-    ("self_attn.q_proj.bias", "output"),
+    ("self_attn.q_proj.weight", "input"),   # project residual side only, slice heads
+    ("self_attn.q_proj.bias", "head_slice"),
     ("self_attn.k_proj.weight", "input"),
-    ("self_attn.k_proj.bias", "skip"),
+    ("self_attn.k_proj.bias", "head_slice"),
     ("self_attn.v_proj.weight", "input"),
-    ("self_attn.v_proj.bias", "skip"),
-    ("self_attn.o_proj.weight", "both"),
+    ("self_attn.v_proj.bias", "head_slice"),
+    ("self_attn.o_proj.weight", "output"),  # project residual side only, slice heads
     ("self_attn.o_proj.bias", "output"),
     ("mlp.gate_proj.weight", "input"),
     ("mlp.up_proj.weight", "input"),
     ("mlp.down_proj.weight", "output"),
+    ("self_attn.q_norm.weight", "head_norm"),
+    ("self_attn.k_norm.weight", "head_norm"),
     ("input_layernorm.weight", "norm"),
     ("post_attention_layernorm.weight", "norm"),
 ]
@@ -88,6 +150,7 @@ class WidthCompressor:
         self.arch = arch
         self.covariance = covariance
         self.Q_top: Tensor | None = None  # [d, d']
+        self.norm_scale: float = 1.0      # RMSNorm compensation factor
 
     # ---- Phase 1: Compute projection matrix ----
 
@@ -110,6 +173,13 @@ class WidthCompressor:
         # Take last d' eigenvectors (largest eigenvalues = most important)
         Q_top = Q[:, -d_prime:]  # [d, d']
 
+        log = get_logger()
+        log.section("PCA Projection Matrix")
+        log.info(f"Covariance: {self.covariance.shape}, eigenvalues range: "
+                 f"[{eigenvalues.min().item():.6f}, {eigenvalues.max().item():.6f}]")
+        retained_var = eigenvalues[-d_prime:].sum() / eigenvalues.sum()
+        log.info(f"Retained variance: {retained_var*100:.1f}% ({d_prime}/{d} dims)")
+
         # Verify orthogonality: Q_top.T @ Q_top ≈ I
         identity_check = Q_top.T @ Q_top
         off_diag = identity_check - torch.eye(d_prime, device=identity_check.device,
@@ -119,103 +189,117 @@ class WidthCompressor:
             print(f"  Warning: Q_top not perfectly orthogonal (max off-diag error={ortho_error:.2e})")
 
         self.Q_top = Q_top.to(dtype=torch.float32)
+
+        # RMSNorm scale compensation: PCA keeps high-variance dims,
+        # so compressed-space RMS > original-space RMS. RMSNorm would
+        # over-normalize without this factor.
+        lambda_top = eigenvalues[-d_prime:]
+        mean_top = lambda_top.mean().clamp(min=1e-8)
+        mean_all = eigenvalues.mean().clamp(min=1e-8)
+        self.norm_scale = torch.sqrt(mean_top / mean_all).item()
+        print(f"  Q_top shape: {list(Q_top.shape)}, "
+              f"norm_scale: {self.norm_scale:.4f}")
+
         return self.Q_top
 
     # ---- Phase 2: Project weights ----
 
     def _project_weight(self, weight: Tensor, key: str) -> Tensor:
-        """Apply projection + slicing to a single weight tensor.
-
-        Args:
-            weight: Original weight tensor.
-            key: State dict key (e.g. "model.layers.0.self_attn.q_proj.weight").
-
-        Returns:
-            Projected and sliced weight tensor with target dimensions.
-        """
         Q = self.Q_top.to(device=weight.device, dtype=weight.dtype)
-
-        # Determine the rule for this key
         rule = _get_projection_rule(key)
 
-        if rule == "both":
-            # Q_top.T @ W @ Q_top  [d', d']
-            result = Q.T @ weight @ Q  # [d', d, d] @ [d, d'] → [d', d']
-            # Both dimensions now equal d' = target_num_heads * target_head_dim
+        # --- 1D tensors (biases, norms) ---
+        if weight.dim() == 1:
+            if rule == "norm":
+                # After norm absorption, gamma=1 in original model.
+                # In compressed model, use ones(target_embed_dim) — pure
+                # normalization without scaling, which is orthogonal-invariant.
+                return torch.ones(self.arch.target_embed_dim,
+                                  device=weight.device, dtype=weight.dtype)
+            elif rule == "head_norm":
+                # head_dim is frozen, no slicing needed
+                return weight.clone()
+            elif rule == "head_slice":
+                return self._slice_head_bias(weight, key)
+            elif rule == "input":
+                return weight[:self.arch.target_intermediate_size]
+            elif rule == "output":
+                return (Q.T @ weight).contiguous()
+            else:
+                return weight.clone()
 
-        elif rule == "input":
-            # W @ Q_top  [out, d'] then slice out-dim if needed
-            result = weight @ Q  # [out, d] @ [d, d'] → [out, d']
-            result = self._slice_attention_output(result, key)
-
+        # --- 2D weight matrices ---
+        if rule == "input":
+            result = weight @ Q  # [out, d'] then slice out-dim
+            result = self._slice_output_dim(result, key)
         elif rule == "output":
-            # Q_top.T @ W  [d', in] then slice in-dim if needed
-            result = Q.T @ weight  # [d', d] @ [d, in] → [d', in]
-            result = self._slice_attention_output(result, key)
-
+            result = Q.T @ weight  # [d', in] then slice in-dim
+            result = self._slice_input_dim(result, key)
         elif rule == "embed":
-            # W @ Q_top  [V, d']
-            result = weight @ Q  # [V, d] @ [d, d'] → [V, d']
-
-        elif rule == "norm":
-            # Slice first d' elements
-            result = weight[:self.arch.target_embed_dim]
-
+            result = weight @ Q  # [V, d']
         elif rule == "skip":
-            # No projection
+            result = weight.clone()
+        else:
             result = weight.clone()
 
         return result.contiguous()
 
-    def _slice_attention_output(self, weight: Tensor, key: str) -> Tensor:
-        """Slice attention head dimensions or FFN intermediate dimensions.
+    # ---- Attention head / FFN slicing helpers ----
+    # head_dim is FROZEN: only num_heads / num_kv_heads are reduced
 
-        This is applied AFTER Q projection when the output dimension
-        is not in residual stream space (e.g., k_proj, v_proj, gate_proj, up_proj,
-        down_proj).
-
-        Args:
-            weight: Already Q-projected weight.
-            key: State dict key for context.
-
-        Returns:
-            Sliced weight.
-        """
-        orig_out_dim, new_in_dim = weight.shape
+    def _slice_output_dim(self, weight: Tensor, key: str) -> Tensor:
+        """Slice OUTPUT dimension. head_dim is FROZEN, only reduce head count."""
         target = self.arch
+        hd = self.arch.head_dim  # original head_dim, unchanged
 
-        # k_proj or v_proj: [num_kv_heads * head_dim, d'] → [target_num_kv_heads * target_head_dim, d']
+        if "q_proj" in key:
+            nh = self.arch.num_attention_heads
+            w = weight.reshape(nh, hd, -1)
+            w = w[:target.target_num_heads, :, :]
+            return w.reshape(target.target_num_heads * hd, -1)
+
         if "k_proj" in key or "v_proj" in key:
-            # reshape → slice → flatten
-            num_kv = self.arch.num_kv_heads
-            hd = self.arch.head_dim
-            # [num_kv*hd, d'] → [num_kv, hd, d']
-            w_reshaped = weight.reshape(num_kv, hd, new_in_dim)
-            # Slice to target
-            w_sliced = w_reshaped[:target.target_num_kv_heads, :target.target_head_dim, :]
-            result = w_sliced.reshape(target.target_num_kv_heads * target.target_head_dim, new_in_dim)
+            nk = self.arch.num_kv_heads
+            w = weight.reshape(nk, hd, -1)
+            w = w[:target.target_num_kv_heads, :, :]
+            return w.reshape(target.target_num_kv_heads * hd, -1)
 
-        # q_proj: already handled by "both" rule, but verify
-        elif "q_proj" in key:
-            # Both-side projection already reduces to [d', d'] = [target_heads*head_dim, d']
-            result = weight
+        if "gate_proj" in key or "up_proj" in key:
+            return weight[:target.target_intermediate_size, :]
 
-        # o_proj: already handled by "both" rule
-        elif "o_proj" in key:
-            result = weight
+        return weight
 
-        # gate_proj or up_proj: [intermediate, d'] → [target_intermediate, d']
-        elif "gate_proj" in key or "up_proj" in key:
-            result = weight[:target.target_intermediate_size, :]
+    def _slice_input_dim(self, weight: Tensor, key: str) -> Tensor:
+        """Slice INPUT dimension. head_dim is FROZEN, only reduce head count."""
+        target = self.arch
+        hd = self.arch.head_dim
 
-        # down_proj: [d', intermediate] → [d', target_intermediate]
-        elif "down_proj" in key:
-            result = weight[:, :target.target_intermediate_size]
+        if "o_proj" in key:
+            nh = self.arch.num_attention_heads
+            w = weight.reshape(-1, nh, hd)
+            w = w[:, :target.target_num_heads, :]
+            return w.reshape(-1, target.target_num_heads * hd)
 
-        else:
-            result = weight
+        if "down_proj" in key:
+            return weight[:, :target.target_intermediate_size]
 
-        return result
+        return weight
+
+    def _slice_head_bias(self, weight: Tensor, key: str) -> Tensor:
+        """Slice bias terms in attention head space. head_dim is frozen."""
+        target = self.arch
+        hd = self.arch.head_dim
+        if "q_proj" in key:
+            nh = self.arch.num_attention_heads
+            w = weight.reshape(nh, hd)
+            w = w[:target.target_num_heads, :]
+            return w.reshape(-1)
+        if "k_proj" in key or "v_proj" in key:
+            nk = self.arch.num_kv_heads
+            w = weight.reshape(nk, hd)
+            w = w[:target.target_num_kv_heads, :]
+            return w.reshape(-1)
+        return weight
 
     # ---- Phase 3: Build compressed model ----
 
@@ -236,6 +320,10 @@ class WidthCompressor:
         target = self.arch
         state_dict = original_model.state_dict()
 
+        # ---- Norm absorption: fuse RMSNorm γ into adjacent Linear weights ----
+        # This MUST happen before PCA projection. See docstring for proof.
+        state_dict = _absorb_norms(state_dict, target.num_layers)
+
         # Build target config
         target_config = self._build_target_config(original_config)
 
@@ -252,6 +340,27 @@ class WidthCompressor:
 
         if skipped_keys:
             print(f"  Skipped {len(skipped_keys)} keys: {skipped_keys}")
+
+        # Count projected weights by rule
+        log = get_logger()
+        rule_counts: dict[str, int] = {}
+        for key in new_state_dict:
+            rule_counts[_get_projection_rule(key)] = \
+                rule_counts.get(_get_projection_rule(key), 0) + 1
+        log.section("Weight Projection Summary")
+        for rule, count in sorted(rule_counts.items()):
+            log.info(f"  {rule}: {count} weights")
+
+        # Handle tied embeddings: if original had tie_word_embeddings=True,
+        # the state dict has no lm_head.weight. The target config has
+        # tie_word_embeddings=False, so we must provide lm_head.weight
+        # explicitly (copy from projected embed_tokens).
+        tied = getattr(original_config, "tie_word_embeddings", False)
+        if tied and "lm_head.weight" not in new_state_dict:
+            if "model.embed_tokens.weight" in new_state_dict:
+                new_state_dict["lm_head.weight"] = new_state_dict[
+                    "model.embed_tokens.weight"].clone()
+                print("  Untied embeddings: copied embed_tokens.weight → lm_head.weight")
 
         # Create new model with target config
         with torch.no_grad():
@@ -327,8 +436,10 @@ def verify_residual_consistency(model: nn.Module,
         AssertionError: If any consistency check fails.
     """
     model.eval()
+    # Use model's own device to avoid device mismatch
+    model_device = next(model.parameters()).device
     dummy_input = torch.randint(0, min(tokenizer.vocab_size, 1000),
-                                 (1, 16), device=device)
+                                 (1, 16), device=model_device)
 
     with torch.no_grad():
         output = model(dummy_input, output_hidden_states=True)

@@ -17,6 +17,7 @@ from . import __version__
 from .calibration import compute_global_covariance
 from .compress import WidthCompressor, verify_residual_consistency
 from .config import DepthConfig, DistillConfig, PipelineConfig, WidthConfig
+from .debug_log import enable_debug, get_logger
 from .distill import DistillationTrainer
 from .export import export_to_hf
 from .inspect import compute_targets, inspect_model
@@ -90,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Tokens student generates per step")
 
     # Pipeline control
+    p.add_argument("--debug", action="store_true",
+                   help="Print detailed debug info for every weight operation")
     p.add_argument("--skip-distill", action="store_true",
                    help="Skip distillation (combine with --distill to undo)")
     p.add_argument("--skip-benchmark", action="store_true",
@@ -101,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run_pipeline(config: PipelineConfig) -> None:
     """Execute the full draft-adapter pipeline."""
     set_seed(config.seed)
+    if config.debug:
+        enable_debug()
+    log = get_logger()
 
     # ============================================================
     # STEP 0: Load config (lightweight — no model weights)
@@ -136,6 +142,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         config.tokenizer or config.model,
         trust_remote_code=True,
+        padding_side="left",
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -177,6 +184,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     compressor.compute_projection()
 
     compressed_model, _ = compressor.compress(model, original_config)
+    compressed_model = compressed_model.to(config.device)
     params = count_parameters(compressed_model)
     print(f"  Compressed model: {format_param_count(params['total'])} parameters")
 
@@ -207,6 +215,7 @@ def run_pipeline(config: PipelineConfig) -> None:
 
     pruned_model = pruner.prune_model(compressed_model, keep_indices,
                                        compressed_model.config)
+    pruned_model = pruned_model.to(config.device)
     params = count_parameters(pruned_model)
     print(f"  Pruned model: {format_param_count(params['total'])} parameters")
 
@@ -255,9 +264,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     # STEP 6/6: Export to HF format
     # ============================================================
     print("\n[6/6] Exporting draft model to HF format...")
-    export_to_hf(final_model, arch, tokenizer,
-                 original_config=original_config,
-                 output_dir=config.output)
+    export_to_hf(final_model, arch, tokenizer, output_dir=config.output)
 
     final_param_count = count_parameters(final_model)['total']
     print(f"\n{'='*60}")
@@ -308,6 +315,7 @@ def main():
         distill=distill_cfg,
         skip_distill=args.skip_distill or not args.distill,
         skip_benchmark=args.skip_benchmark,
+        debug=args.debug,
     )
 
     run_pipeline(config)
