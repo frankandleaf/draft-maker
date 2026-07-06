@@ -91,7 +91,3 @@ On-policy distillation: the student (draft) generates tokens, the teacher scores
 - [DistillSpec: Improving Speculative Decoding via Knowledge Distillation](https://arxiv.org/abs/2310.08461) — Zhou et al., ICLR 2024
 - [AdaSPEC: Selective Knowledge Distillation for Efficient Speculative Decoders](https://arxiv.org/abs/2510.19779) — Hu et al., NeurIPS 2025
 - [Swift-SVD: Theoretical Optimality Meets Practical Efficiency in Low-Rank LLM Compression](https://arxiv.org/abs/2604.01609) — Qi et al., ICML 2026
-
-## License
-
-MIT
