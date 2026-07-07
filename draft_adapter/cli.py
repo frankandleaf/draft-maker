@@ -93,6 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Tokens student generates per step")
 
     # Pipeline control
+    p.add_argument("--teacher-device", default=None,
+                   help="Device for teacher model during distillation "
+                        "(default: 'auto' for multi-GPU, same as --device otherwise)")
     p.add_argument("--debug", action="store_true",
                    help="Print detailed debug info for every weight operation")
     p.add_argument("--skip-distill", action="store_true",
@@ -255,11 +258,18 @@ def run_pipeline(config: PipelineConfig) -> None:
         print(f"\n[5/6] Distillation (on-policy top-K KL, "
               f"mode={config.distill.kl_mode})...")
 
+        # Smart default for teacher device: auto on multi-GPU, same as --device otherwise
+        teacher_device = config.teacher_device
+        if teacher_device is None:
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            teacher_device = "auto" if n_gpus > 1 else config.device
+        print(f"  Teacher device: {teacher_device}")
+
         # Reload teacher for distillation (was freed after compression)
         teacher = AutoModelForCausalLM.from_pretrained(
             config.model,
             torch_dtype=dtype,
-            device_map=config.device,
+            device_map=teacher_device,
             trust_remote_code=True,
         )
         teacher.eval()
@@ -349,6 +359,7 @@ def main():
         skip_benchmark=args.skip_benchmark,
         debug=args.debug,
         method=args.method,
+        teacher_device=args.teacher_device,
     )
 
     run_pipeline(config)

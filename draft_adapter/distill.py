@@ -74,20 +74,36 @@ class DistillationTrainer:
             kl = 0.5 * (t_probs - s_probs).abs().sum(dim=-1)
         return kl.mean()
 
+    # ---- Device helpers ----
+
+    @property
+    def _teacher_device(self) -> torch.device:
+        return next(self.teacher.parameters()).device
+
+    @property
+    def _student_device(self) -> torch.device:
+        return next(self.student.parameters()).device
+
     # ---- Teacher forward (no grad) ----
     @torch.no_grad()
     def _teacher_forward(self, input_ids: Tensor) -> Tensor:
+        device = self._teacher_device
+        ids = input_ids.to(device)
         out = self.teacher(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids, device=input_ids.device),
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids, device=device),
         )
-        return out.logits.detach()
+        logits = out.logits.detach().to(input_ids.device)
+        del out
+        return logits
 
     # ---- Student forward ----
     def _student_logits(self, input_ids: Tensor) -> Tensor:
+        device = self._student_device
+        ids = input_ids.to(device)
         out = self.student(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids, device=input_ids.device),
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids, device=device),
         )
         return out.logits
 
@@ -96,32 +112,32 @@ class DistillationTrainer:
     def train_step_recovery(self, prompt_ids: Tensor) -> dict:
         """Teacher generates; student learns to match on teacher's tokens."""
         gen_len = self.config.generate_len
-        device = prompt_ids.device
+        student_device = prompt_ids.device
 
-        # Teacher generates high-quality tokens
+        # Teacher generates high-quality tokens (on teacher's device)
+        prompt_on_teacher = prompt_ids.to(self._teacher_device)
         teacher_gen = self.teacher.generate(
-            prompt_ids, max_new_tokens=gen_len, do_sample=True,
+            prompt_on_teacher, max_new_tokens=gen_len, do_sample=True,
             temperature=1.0,
             pad_token_id=self.tokenizer.pad_token_id
                          or self.tokenizer.eos_token_id,
         )
-        full_ids = teacher_gen[:, :prompt_ids.shape[1] + gen_len]
+        full_ids = teacher_gen[:, :prompt_ids.shape[1] + gen_len].to(student_device)
+        del teacher_gen, prompt_on_teacher
 
         # Student forward
         student_out = self.student(
             input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids, device=full_ids.device),
+            attention_mask=torch.ones_like(full_ids, device=student_device),
         )
         student_logits = student_out.logits
 
         # CE loss: predict teacher's next token at each position
-        # Only on the generated portion (after prompt)
-        labels = full_ids[:, 1:].contiguous()  # [batch, seq-1]
-        s_logits = student_logits[:, :-1, :].contiguous()  # [batch, seq-1, vocab]
+        labels = full_ids[:, 1:].contiguous()
+        s_logits = student_logits[:, :-1, :].contiguous()
 
-        # Mask: only compute loss on generated tokens (after prompt)
         prompt_len = prompt_ids.shape[1]
-        gen_mask = torch.zeros(labels.shape, device=labels.device)
+        gen_mask = torch.zeros(labels.shape, device=student_device)
         gen_mask[:, max(0, prompt_len - 1):] = 1.0
         loss = F.cross_entropy(
             s_logits.reshape(-1, s_logits.shape[-1]),
@@ -142,7 +158,7 @@ class DistillationTrainer:
     def train_step_speculative(self, prompt_ids: Tensor) -> dict:
         """Student generates; teacher scores → top-K KL on student's tokens."""
         gen_len = min(self.config.generate_len, 32)
-        device = prompt_ids.device
+        student_device = prompt_ids.device
 
         # Student generates (on-policy)
         self.student.eval()
@@ -155,12 +171,13 @@ class DistillationTrainer:
             )
         self.student.train()
 
-        full_ids = student_gen[:, :prompt_ids.shape[1] + gen_len]
+        full_ids = student_gen[:, :prompt_ids.shape[1] + gen_len].to(student_device)
+        del student_gen
 
-        # Teacher scores student's tokens
+        # Teacher scores student's tokens (cross-device safe)
         teacher_logits = self._teacher_forward(full_ids)
 
-        # Student forward (compiled if available)
+        # Student forward
         student_logits = self._student_logits(full_ids)
 
         min_len = min(teacher_logits.shape[1], student_logits.shape[1])
@@ -177,6 +194,9 @@ class DistillationTrainer:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
         self.optimizer.step()
+        del teacher_logits, student_logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return {"loss": loss.item(), "phase": "speculative"}
 
@@ -194,7 +214,7 @@ class DistillationTrainer:
         pbar = tqdm(range(total), desc="Distilling")
         for step in pbar:
             idx = torch.randint(0, n_prompts, (bs,))
-            batch = train_input_ids[idx].to(self.student.device)
+            batch = train_input_ids[idx].to(self._student_device)
             # Prompt = first half, student/teacher generates second half
             prompt_len = batch.shape[1] // 2
             prompts = batch[:, :prompt_len]

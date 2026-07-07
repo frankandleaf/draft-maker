@@ -105,6 +105,7 @@ class PipelineConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     seed: int = 42
+    teacher_device: str | None = None
     width: WidthConfig = field(default_factory=WidthConfig)
     depth: DepthConfig = field(default_factory=DepthConfig)
     distill: DistillConfig | None = None
