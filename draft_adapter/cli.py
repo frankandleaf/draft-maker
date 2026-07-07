@@ -16,6 +16,7 @@ from transformers import AutoConfig
 from . import __version__
 from .calibration import compute_global_covariance
 from .compress import WidthCompressor, verify_residual_consistency
+from .compress_ffn import SwiftSVDCompressor
 from .config import DepthConfig, DistillConfig, PipelineConfig, WidthConfig
 from .debug_log import enable_debug, get_logger
 from .distill import DistillationTrainer
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="bfloat16",
                    choices=["float32", "float16", "bfloat16"])
     p.add_argument("--seed", type=int, default=42)
+
+    # Method
+    p.add_argument("--method", default="slicegpt",
+                   choices=["slicegpt", "swift-svd"],
+                   help="Compression algorithm")
 
     # Width compression (hd, hs, es)
     p.add_argument("--hd", type=float, default=0.5,
@@ -120,7 +126,19 @@ def run_pipeline(config: PipelineConfig) -> None:
     # ============================================================
     print("\n[1/6] Inspecting model architecture...")
     arch = inspect_model(config.model)
-    arch = compute_targets(arch, config.width, config.depth)
+    if config.method == "swift-svd":
+        # Only compress FFN + heads, hidden_size stays
+        es, hs = config.width.embed_size_factor, config.width.head_size_factor
+        config.width.embed_size_factor = 1.0
+        config.width.head_size_factor = 1.0
+        arch = compute_targets(arch, config.width, config.depth)
+        arch.target_embed_dim = arch.hidden_size
+        arch.target_head_dim = arch.head_dim
+        arch.target_intermediate_size = max(8, int(arch.intermediate_size * es))
+        arch.target_num_heads = max(1, int(arch.num_attention_heads * hs))
+        arch.target_num_kv_heads = max(1, arch.target_num_heads // arch.num_kv_groups)
+    else:
+        arch = compute_targets(arch, config.width, config.depth)
 
     print(f"  Model type: {arch.model_type}")
     print(f"  Original: {arch.num_layers}L, {arch.hidden_size}d, "
@@ -167,26 +185,35 @@ def run_pipeline(config: PipelineConfig) -> None:
     print(f"  Calibration data: {calib_ids.shape[0]} seqs x "
           f"{calib_ids.shape[1]} tokens")
 
-    # Compute global covariance (Swift-SVD style incremental aggregation)
-    print("  Computing global covariance matrix...")
-    aggregator = compute_global_covariance(
-        model, calib_ids,
-        chunk_size=4,
-    )
-    covariance = aggregator.compute()
-    print(f"  Covariance matrix: {covariance.shape} (conditioning...)")
-
     # ============================================================
-    # STEP 3/6: Width compression (SliceGPT)
+    # STEP 2b-3/6: Compression (method-dependent)
     # ============================================================
-    print("\n[3/6] Width compression (global SliceGPT)...")
-    compressor = WidthCompressor(arch, covariance=covariance)
-    compressor.compute_projection()
+    if config.method == "swift-svd":
+        print("\n[2b/6] Computing importance scores (heads + FFN)...")
+        compressor = SwiftSVDCompressor(arch)
+        compressor.compute_head_importance(model, calib_ids)
+        compressor.compute_ffn_importance(model, calib_ids)
+        print("\n[3/6] Pruning attention heads + FFN neurons...")
+        compressed_model, _ = compressor.prune(model, original_config)
+        compressed_model = compressed_model.to(config.device)
+        params = count_parameters(compressed_model)
+        print(f"  Compressed: {format_param_count(params['total'])} parameters")
+        print(f"  Residual stream: unchanged (no PCA rotation)")
+    else:
+        # Compute global covariance
+        print("  Computing global covariance matrix...")
+        aggregator = compute_global_covariance(model, calib_ids, chunk_size=4)
+        covariance = aggregator.compute()
+        print(f"  Covariance matrix: {covariance.shape} (conditioning...)")
 
-    compressed_model, _ = compressor.compress(model, original_config)
-    compressed_model = compressed_model.to(config.device)
-    params = count_parameters(compressed_model)
-    print(f"  Compressed model: {format_param_count(params['total'])} parameters")
+        # SliceGPT: PCA residual stream rotation + weight slicing
+        print("\n[3/6] Width compression (global SliceGPT)...")
+        compressor = WidthCompressor(arch, covariance=covariance)
+        compressor.compute_projection()
+        compressed_model, _ = compressor.compress(model, original_config)
+        compressed_model = compressed_model.to(config.device)
+        params = count_parameters(compressed_model)
+        print(f"  Compressed model: {format_param_count(params['total'])} parameters")
 
     # Verify residual stream consistency
     print("  Verifying residual stream consistency...")
@@ -316,6 +343,7 @@ def main():
         skip_distill=args.skip_distill or not args.distill,
         skip_benchmark=args.skip_benchmark,
         debug=args.debug,
+        method=args.method,
     )
 
     run_pipeline(config)

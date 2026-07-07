@@ -115,6 +115,7 @@ class PipelineConfig:
     skip_distill: bool = False
     skip_benchmark: bool = False
     debug: bool = False
+    method: str = "slicegpt"
 
     def __post_init__(self):
         if self.tokenizer is None:
