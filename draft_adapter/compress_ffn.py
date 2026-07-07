@@ -168,8 +168,14 @@ class SwiftSVDCompressor:
         if hasattr(cfg, 'tie_word_embeddings'):
             cfg.tie_word_embeddings = False
 
+        # Move original model to CPU to free GPU memory
+        target_device = model.device
+        model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         cm = AutoModelForCausalLM.from_config(
-            cfg, torch_dtype=model.dtype).to(model.device)
+            cfg, torch_dtype=model.dtype).to(target_device)
         src = model.state_dict()
         dst = cm.state_dict()
         log = get_logger()
