@@ -328,16 +328,39 @@ class WidthCompressor:
         # This MUST happen before PCA projection. See docstring for proof.
         state_dict = _absorb_norms(state_dict, target.num_layers)
 
-        # Build target config
+        # ---- Move model to CPU to free GPU memory for projected weights ----
+        q_device = self.Q_top.device
+        original_model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Build target config + model first, then project weights
+        # layer-by-layer directly into it — no intermediate new_state_dict
         target_config = self._build_target_config(original_config)
 
-        # Project all weights
-        new_state_dict: dict[str, Tensor] = {}
+        with torch.no_grad():
+            compressed_model = AutoModelForCausalLM.from_config(
+                target_config,
+                torch_dtype=original_model.dtype,
+            )
+        target_sd = compressed_model.state_dict()
+
         skipped_keys: list[str] = []
+        rule_counts: dict[str, int] = {}
 
         for key, weight in tqdm(state_dict.items(), desc="Projecting weights"):
+            if key not in target_sd:
+                skipped_keys.append(key)
+                continue
             try:
-                new_state_dict[key] = self._project_weight(weight, key)
+                projected = self._project_weight(
+                    weight.to(q_device) if weight.device.type != 'cuda' else weight,
+                    key,
+                )
+                target_sd[key].copy_(projected.to(target_sd[key].dtype))
+                del projected
+                rule_counts[_get_projection_rule(key)] = \
+                    rule_counts.get(_get_projection_rule(key), 0) + 1
             except Exception as e:
                 print(f"  Warning: skipping {key} ({e})")
                 skipped_keys.append(key)
@@ -345,44 +368,20 @@ class WidthCompressor:
         if skipped_keys:
             print(f"  Skipped {len(skipped_keys)} keys: {skipped_keys}")
 
-        # Count projected weights by rule
+        # Handle tied embeddings: copy projected embed_tokens -> lm_head
+        tied = getattr(original_config, "tie_word_embeddings", False)
+        if tied and "lm_head.weight" in target_sd:
+            target_sd["lm_head.weight"].copy_(
+                target_sd["model.embed_tokens.weight"]
+            )
+            print("  Untied embeddings: copied embed_tokens.weight → lm_head.weight")
+
         log = get_logger()
-        rule_counts: dict[str, int] = {}
-        for key in new_state_dict:
-            rule_counts[_get_projection_rule(key)] = \
-                rule_counts.get(_get_projection_rule(key), 0) + 1
         log.section("Weight Projection Summary")
         for rule, count in sorted(rule_counts.items()):
             log.info(f"  {rule}: {count} weights")
 
-        # Handle tied embeddings: if original had tie_word_embeddings=True,
-        # the state dict has no lm_head.weight. The target config has
-        # tie_word_embeddings=False, so we must provide lm_head.weight
-        # explicitly (copy from projected embed_tokens).
-        tied = getattr(original_config, "tie_word_embeddings", False)
-        if tied and "lm_head.weight" not in new_state_dict:
-            if "model.embed_tokens.weight" in new_state_dict:
-                new_state_dict["lm_head.weight"] = new_state_dict[
-                    "model.embed_tokens.weight"].clone()
-                print("  Untied embeddings: copied embed_tokens.weight → lm_head.weight")
-
-        # Create new model with target config
-        with torch.no_grad():
-            compressed_model = AutoModelForCausalLM.from_config(
-                target_config,
-                torch_dtype=original_model.dtype,
-            )
-
-        # Load projected weights (strict=False handles missing/mismatched keys)
-        missing, unexpected = compressed_model.load_state_dict(
-            new_state_dict, strict=False
-        )
-        if missing:
-            print(f"  Missing keys: {missing}")
-        if unexpected:
-            print(f"  Unexpected keys: {unexpected}")
-
-        return compressed_model, new_state_dict
+        return compressed_model, {}
 
     def _build_target_config(self, original_config):
         """Create a config for the compressed model (deep copy from original)."""

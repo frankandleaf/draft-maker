@@ -171,17 +171,19 @@ class SwiftSVDCompressor:
         cm = AutoModelForCausalLM.from_config(
             cfg, torch_dtype=model.dtype).to(model.device)
         src = model.state_dict()
-        new_sd = {}
+        dst = cm.state_dict()
         log = get_logger()
         log.section(f"Prune: FFN {self.arch.intermediate_size}→{t_ff}, "
                     f"heads {nh}→{t_nh}/{nk}→{t_nk}")
 
         for key in src:
+            if key not in dst:
+                continue
+
             parts = key.split(".")
-            # --- Global weights: copy ---
+            # --- Global weights: copy directly ---
             if "layers" not in parts:
-                if key in cm.state_dict():
-                    new_sd[key] = src[key].clone()
+                dst[key].copy_(src[key])
                 continue
 
             lidx = int(parts[2])
@@ -193,7 +195,7 @@ class SwiftSVDCompressor:
                     idx = imp.topk(t_nh).indices.sort()[0] if imp is not None \
                         else torch.arange(t_nh, device=src[key].device)
                     w = src[key].reshape(nh, hd, -1)[idx]
-                    new_sd[key] = w.reshape(t_nh * hd, -1).clone()
+                    dst[key].copy_(w.reshape(t_nh * hd, -1))
                     continue
 
                 if ("k_proj.weight" in key or "v_proj.weight" in key):
@@ -201,7 +203,7 @@ class SwiftSVDCompressor:
                     idx = imp.topk(t_nk).indices.sort()[0] if imp is not None \
                         else torch.arange(t_nk, device=src[key].device)
                     w = src[key].reshape(nk, hd, -1)[idx]
-                    new_sd[key] = w.reshape(t_nk * hd, -1).clone()
+                    dst[key].copy_(w.reshape(t_nk * hd, -1))
                     continue
 
                 if "o_proj.weight" in key:
@@ -209,28 +211,29 @@ class SwiftSVDCompressor:
                     idx = imp.topk(t_nh).indices.sort()[0] if imp is not None \
                         else torch.arange(t_nh, device=src[key].device)
                     w = src[key].reshape(-1, nh, hd)[:, idx]
-                    new_sd[key] = w.reshape(-1, t_nh * hd).clone()
+                    dst[key].copy_(w.reshape(-1, t_nh * hd))
                     continue
 
                 if "q_norm.weight" in key:
-                    # head_dim frozen; may be [head_dim] (shared) or [nh*hd] (per-head)
                     if src[key].numel() == hd:
-                        new_sd[key] = src[key].clone()
+                        dst[key].copy_(src[key])
                     else:
                         imp = self.head_importance.get(lidx)
                         idx = imp.topk(t_nh).indices.sort()[0] if imp is not None \
                             else torch.arange(t_nh, device=src[key].device)
-                        new_sd[key] = src[key].reshape(nh, hd)[idx].reshape(-1).clone()
+                        w = src[key].reshape(nh, hd)[idx].reshape(-1)
+                        dst[key].copy_(w)
                     continue
 
                 if "k_norm.weight" in key:
                     if src[key].numel() == hd:
-                        new_sd[key] = src[key].clone()
+                        dst[key].copy_(src[key])
                     else:
                         imp = self.kv_importance.get(lidx)
                         idx = imp.topk(t_nk).indices.sort()[0] if imp is not None \
                             else torch.arange(t_nk, device=src[key].device)
-                        new_sd[key] = src[key].reshape(nk, hd)[idx].reshape(-1).clone()
+                        w = src[key].reshape(nk, hd)[idx].reshape(-1)
+                        dst[key].copy_(w)
                     continue
 
             # --- FFN weights ---
@@ -239,22 +242,15 @@ class SwiftSVDCompressor:
                 idx = imp.topk(t_ff).indices.sort()[0] if imp is not None \
                     else torch.arange(t_ff, device=src[key].device)
                 if "down_proj" in key:
-                    new_sd[key] = src[key][:, idx].clone()
+                    dst[key].copy_(src[key][:, idx])
                 else:
-                    new_sd[key] = src[key][idx].clone()
+                    dst[key].copy_(src[key][idx])
                 continue
 
             # --- Everything else (bias, norm, rotary) ---
-            if key in cm.state_dict():
-                new_sd[key] = src[key].clone()
+            dst[key].copy_(src[key])
 
-        if "lm_head.weight" not in new_sd and "model.embed_tokens.weight" in new_sd:
-            new_sd["lm_head.weight"] = new_sd["model.embed_tokens.weight"].clone()
+        if "lm_head.weight" in dst and "model.embed_tokens.weight" in dst:
+            dst["lm_head.weight"].copy_(dst["model.embed_tokens.weight"])
 
-        missing, unexpected = cm.load_state_dict(new_sd, strict=False)
-        if missing:
-            log.info(f"Missing: {missing[:3]}...")
-        if unexpected:
-            log.info(f"Unexpected: {unexpected[:3]}...")
-
-        return cm, new_sd
+        return cm, {}
