@@ -54,8 +54,10 @@ def _absorb_norms(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, T
       model.norm          →  lm_head
 
     After absorption, all norm weights become ones.
+
+    NOTE: modifies state_dict IN PLACE to avoid cloning the entire dict
+    (which doubles GPU memory for large models).
     """
-    sd = {k: v.clone() for k, v in state_dict.items()}
     log = get_logger()
 
     log.section("Norm Absorption: fusing RMSNorm γ → adjacent Linear weights")
@@ -66,36 +68,38 @@ def _absorb_norms(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, T
 
         # input_layernorm → q_proj, k_proj, v_proj
         in_ln_key = f"{prefix}.input_layernorm.weight"
-        if in_ln_key in sd:
-            gamma = sd[in_ln_key]
+        if in_ln_key in state_dict:
+            gamma = state_dict[in_ln_key]
             log.before(f"L{i} input_layernorm → q/k/v",
                        gamma_norm=gamma.float().norm(), gamma_len=gamma.shape[0])
+            scale = gamma.unsqueeze(0)
             for proj in ["q_proj", "k_proj", "v_proj"]:
                 w_key = f"{prefix}.self_attn.{proj}.weight"
-                if w_key in sd:
-                    w_before = sd[w_key].clone()
-                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
-                    log.weight_diff(f"L{i}.{proj}", w_before, sd[w_key])
-            sd[in_ln_key] = torch.ones_like(gamma)
+                if w_key in state_dict:
+                    w_before = state_dict[w_key].clone()
+                    state_dict[w_key].mul_(scale)
+                    log.weight_diff(f"L{i}.{proj}", w_before, state_dict[w_key])
+            state_dict[in_ln_key] = torch.ones_like(gamma)
             log.info("  → γ set to ones")
 
         # post_attention_layernorm → gate_proj, up_proj
         post_ln_key = f"{prefix}.post_attention_layernorm.weight"
-        if post_ln_key in sd:
-            gamma = sd[post_ln_key]
+        if post_ln_key in state_dict:
+            gamma = state_dict[post_ln_key]
+            scale = gamma.unsqueeze(0)
             for proj in ["gate_proj", "up_proj"]:
                 w_key = f"{prefix}.mlp.{proj}.weight"
-                if w_key in sd:
-                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
-            sd[post_ln_key] = torch.ones_like(gamma)
+                if w_key in state_dict:
+                    state_dict[w_key].mul_(scale)
+            state_dict[post_ln_key] = torch.ones_like(gamma)
 
     # model.norm → lm_head
-    if "model.norm.weight" in sd and "lm_head.weight" in sd:
-        gamma = sd["model.norm.weight"]
-        sd["lm_head.weight"] = sd["lm_head.weight"] * gamma.unsqueeze(0)
-        sd["model.norm.weight"] = torch.ones_like(gamma)
+    if "model.norm.weight" in state_dict and "lm_head.weight" in state_dict:
+        gamma = state_dict["model.norm.weight"]
+        state_dict["lm_head.weight"].mul_(gamma.unsqueeze(0))
+        state_dict["model.norm.weight"] = torch.ones_like(gamma)
 
-    return sd
+    return state_dict
 
 
 # --- State dict key patterns and their projection rules ---
