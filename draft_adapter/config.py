@@ -14,16 +14,23 @@ class WidthConfig:
         embed_size_factor: Scales hidden_size / embed_dim and intermediate_size.
         calibration_samples: Number of calibration sequences for PCA.
         calibration_seq_len: Max tokens per calibration sequence.
+        rank_factor: For svd-hybrid method: fraction of rank to keep
+                     in SVD decomposition step. Range (0, 1].
     """
 
     embed_size_factor: float = 0.5
     calibration_samples: int = 16
     calibration_seq_len: int = 512
+    rank_factor: float = 0.5
 
     def __post_init__(self):
         if not 0 < self.embed_size_factor <= 1:
             raise ValueError(
                 f"embed_size_factor must be in (0, 1], got {self.embed_size_factor}"
+            )
+        if not 0 < self.rank_factor <= 1:
+            raise ValueError(
+                f"rank_factor must be in (0, 1], got {self.rank_factor}"
             )
 
 
