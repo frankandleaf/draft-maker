@@ -99,10 +99,7 @@ class DistillationTrainer:
     def _teacher_forward(self, input_ids: Tensor) -> Tensor:
         device = self._teacher_device
         ids = input_ids.to(device)
-        out = self.teacher(
-            input_ids=ids,
-            attention_mask=torch.ones_like(ids, device=device),
-        )
+        out = self.teacher(input_ids=ids)
         logits = out.logits.detach().to(input_ids.device)
         del out
         return logits
@@ -111,10 +108,7 @@ class DistillationTrainer:
     def _student_logits(self, input_ids: Tensor) -> Tensor:
         device = self._student_device
         ids = input_ids.to(device)
-        out = self.student(
-            input_ids=ids,
-            attention_mask=torch.ones_like(ids, device=device),
-        )
+        out = self.student(input_ids=ids)
         return out.logits
 
     # ---- Phase 1: Off-policy recovery (teacher generates, student imitates) ----
@@ -136,10 +130,7 @@ class DistillationTrainer:
         del teacher_gen, prompt_on_teacher
 
         # Student forward
-        student_out = self.student(
-            input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids, device=student_device),
-        )
+        student_out = self.student(input_ids=full_ids)
         student_logits = student_out.logits
 
         # CE loss: predict teacher's next token at each position
