@@ -4,7 +4,7 @@ Turn standard Hugging Face LLMs into vLLM-compatible draft models for speculativ
 
 Given any GQA decoder model (Llama, Qwen3, Mistral, Gemma2), Draft-Adapter automatically produces a compact draft model via width compression, depth pruning, and on-policy distillation. The output is a standard HF-format model that plugs directly into vLLM's `speculative_model` parameter.
 
-Default factors (hd=0.5, hs=0.5, es=0.5, ls=0.75) produce a draft ~10% the size of the original.
+Default factors (es=0.5, ls=0.75) produce a draft ~10% the size of the original.
 
 ## Quick Start
 
@@ -42,8 +42,6 @@ Original Model (HF)
 
 | Flag | Range | Description |
 |------|-------|-------------|
-| `--hd` | (0, 1] | Head dimension multiplier |
-| `--hs` | (0, 1] | Head count multiplier (affects both Q and KV heads) |
 | `--es` | (0, 1] | Embed dimension multiplier |
 | `--ls` | (0, 1] | Layer count multiplier |
 | `--distill` | flag | Enable on-policy distillation |

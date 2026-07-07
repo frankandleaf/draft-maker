@@ -7,23 +7,19 @@ from draft_adapter.config import DepthConfig, DistillConfig, PipelineConfig, Wid
 class TestWidthConfig:
     def test_defaults(self):
         cfg = WidthConfig()
-        assert cfg.head_dim_factor == 0.75
-        assert cfg.head_size_factor == 0.75
         assert cfg.embed_size_factor == 0.5
 
     def test_valid_factors(self):
-        cfg = WidthConfig(head_dim_factor=0.5, head_size_factor=0.3, embed_size_factor=0.1)
-        assert cfg.head_dim_factor == 0.5
+        cfg = WidthConfig(embed_size_factor=0.3)
+        assert cfg.embed_size_factor == 0.3
 
     def test_zero_factor_raises(self):
-        with pytest.raises(ValueError, match="must be in \\(0, 1\\]"):
-            WidthConfig(head_dim_factor=0.0)
         with pytest.raises(ValueError, match="must be in \\(0, 1\\]"):
             WidthConfig(embed_size_factor=0.0)
 
     def test_negative_factor_raises(self):
         with pytest.raises(ValueError, match="must be in \\(0, 1\\]"):
-            WidthConfig(head_size_factor=-0.1)
+            WidthConfig(embed_size_factor=-0.1)
 
     def test_factor_greater_than_one_raises(self):
         with pytest.raises(ValueError, match="must be in \\(0, 1\\]"):

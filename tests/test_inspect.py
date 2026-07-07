@@ -63,8 +63,6 @@ class TestComputeTargets:
         )
 
         width = WidthConfig(
-            head_dim_factor=0.5,   # IGNORED: head_dim is frozen
-            head_size_factor=0.5,  # IGNORED: num_heads derived from embed_dim
             embed_size_factor=0.5, # 2048 -> 1024
         )
         depth = DepthConfig(layer_factor=0.5)  # 24 -> 12
@@ -97,7 +95,7 @@ class TestComputeTargets:
             tie_word_embeddings=False,
         )
 
-        width = WidthConfig(head_dim_factor=0.75, head_size_factor=0.6, embed_size_factor=0.5)
+        width = WidthConfig(embed_size_factor=0.5)
         depth = DepthConfig(layer_factor=0.75)
 
         result = compute_targets(arch, width, depth)
@@ -144,7 +142,7 @@ class TestComputeTargets:
             tie_word_embeddings=False,
         )
 
-        width = WidthConfig(head_dim_factor=0.5, head_size_factor=0.5, embed_size_factor=0.5)
+        width = WidthConfig(embed_size_factor=0.5)
         depth = DepthConfig(layer_factor=0.1, protect_first=1, protect_last=1)  # 8*0.1=0.8->1
 
         result = compute_targets(arch, width, depth)

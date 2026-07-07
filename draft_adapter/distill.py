@@ -74,7 +74,7 @@ class DistillationTrainer:
             kl = 0.5 * (t_probs - s_probs).abs().sum(dim=-1)
         return kl.mean()
 
-    # ---- Teacher forward (no grad, compiled) ----
+    # ---- Teacher forward (no grad) ----
     @torch.no_grad()
     def _teacher_forward(self, input_ids: Tensor) -> Tensor:
         out = self.teacher(
@@ -82,6 +82,14 @@ class DistillationTrainer:
             attention_mask=torch.ones_like(input_ids, device=input_ids.device),
         )
         return out.logits.detach()
+
+    # ---- Student forward ----
+    def _student_logits(self, input_ids: Tensor) -> Tensor:
+        out = self.student(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids, device=input_ids.device),
+        )
+        return out.logits
 
     # ---- Phase 1: Off-policy recovery (teacher generates, student imitates) ----
 

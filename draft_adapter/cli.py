@@ -2,7 +2,7 @@
 
 Usage:
     draft-adapter --model Qwen/Qwen3-1.7B \\
-        --hd 0.75 --hs 0.75 --es 0.5 --ls 0.75 \\
+        --es 0.5 --ls 0.75 \\
         --output ./draft_model --distill
 """
 
@@ -59,11 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["slicegpt", "swift-svd"],
                    help="Compression algorithm")
 
-    # Width compression (hd, hs, es)
-    p.add_argument("--hd", type=float, default=0.5,
-                   help="Head dim multiplier (0-1]")
-    p.add_argument("--hs", type=float, default=0.5,
-                   help="Head count multiplier (0-1]")
+    # Width compression
     p.add_argument("--es", type=float, default=0.5,
                    help="Embed size multiplier (0-1]")
     p.add_argument("--calibration-samples", type=int, default=16,
@@ -128,14 +124,13 @@ def run_pipeline(config: PipelineConfig) -> None:
     arch = inspect_model(config.model)
     if config.method == "swift-svd":
         # Only compress FFN + heads, hidden_size stays
-        es, hs = config.width.embed_size_factor, config.width.head_size_factor
+        width_factor = config.width.embed_size_factor
         config.width.embed_size_factor = 1.0
-        config.width.head_size_factor = 1.0
         arch = compute_targets(arch, config.width, config.depth)
         arch.target_embed_dim = arch.hidden_size
         arch.target_head_dim = arch.head_dim
-        arch.target_intermediate_size = max(8, int(arch.intermediate_size * es))
-        arch.target_num_heads = max(1, int(arch.num_attention_heads * hs))
+        arch.target_intermediate_size = max(8, int(arch.intermediate_size * width_factor))
+        arch.target_num_heads = max(1, int(arch.num_attention_heads * width_factor))
         arch.target_num_kv_heads = max(1, arch.target_num_heads // arch.num_kv_groups)
     else:
         arch = compute_targets(arch, config.width, config.depth)
@@ -306,8 +301,6 @@ def main():
 
     # Build config from CLI args
     width_cfg = WidthConfig(
-        head_dim_factor=args.hd,
-        head_size_factor=args.hs,
         embed_size_factor=args.es,
         calibration_samples=args.calibration_samples,
     )

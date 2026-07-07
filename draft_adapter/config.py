@@ -11,24 +11,20 @@ class WidthConfig:
     Width reduction is absorbed entirely by num_heads.
 
     Attributes:
-        head_dim_factor: (DEPRECATED, kept for CLI compat) Ignored.
-        head_size_factor: Scales num_heads (and num_kv_heads for GQA).
-        embed_size_factor: Scales hidden_size / embed_dim.
+        embed_size_factor: Scales hidden_size / embed_dim and intermediate_size.
         calibration_samples: Number of calibration sequences for PCA.
         calibration_seq_len: Max tokens per calibration sequence.
     """
 
-    head_dim_factor: float = 0.5   # DEPRECATED: head_dim is frozen
-    head_size_factor: float = 0.5
     embed_size_factor: float = 0.5
     calibration_samples: int = 16
     calibration_seq_len: int = 512
 
     def __post_init__(self):
-        for name in ("head_dim_factor", "head_size_factor", "embed_size_factor"):
-            v = getattr(self, name)
-            if not 0 < v <= 1:
-                raise ValueError(f"{name} must be in (0, 1], got {v}")
+        if not 0 < self.embed_size_factor <= 1:
+            raise ValueError(
+                f"embed_size_factor must be in (0, 1], got {self.embed_size_factor}"
+            )
 
 
 @dataclass
@@ -41,7 +37,7 @@ class DepthConfig:
         protect_last: Number of final layers always kept.
     """
 
-    layer_factor: float = 0.75  # hd*hs*es*ls = 0.5*0.5*0.5*0.75 ≈ 0.094 → ~9.4%
+    layer_factor: float = 0.75  # es*ls = 0.5*0.75 ≈ 0.375
     protect_first: int = 1
     protect_last: int = 1
 
