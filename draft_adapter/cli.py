@@ -210,6 +210,11 @@ def run_pipeline(config: PipelineConfig) -> None:
         params = count_parameters(compressed_model)
         print(f"  Compressed model: {format_param_count(params['total'])} parameters")
 
+    # Free teacher to save GPU memory before depth pruning
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Verify residual stream consistency
     print("  Verifying residual stream consistency...")
     verify_residual_consistency(compressed_model, tokenizer, config.device)
@@ -250,6 +255,15 @@ def run_pipeline(config: PipelineConfig) -> None:
         print(f"\n[5/6] Distillation (on-policy top-K KL, "
               f"mode={config.distill.kl_mode})...")
 
+        # Reload teacher for distillation (was freed after compression)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            config.model,
+            torch_dtype=dtype,
+            device_map=config.device,
+            trust_remote_code=True,
+        )
+        teacher.eval()
+
         # Load training data
         train_ids = load_calibration_data(
             tokenizer,
@@ -258,29 +272,27 @@ def run_pipeline(config: PipelineConfig) -> None:
             device=config.device,
         )
 
-        # Teacher is the original model (already loaded)
-        print(f"  Teacher: {format_param_count(count_parameters(model)['total'])} "
+        # Teacher is the original model
+        print(f"  Teacher: {format_param_count(count_parameters(teacher)['total'])} "
               f"(frozen, inference_mode)")
         print(f"  Student: {format_param_count(params['total'])} (training)")
 
         trainer = DistillationTrainer(
-            teacher=model,
+            teacher=teacher,
             student=pruned_model,
             tokenizer=tokenizer,
             config=config.distill,
         )
         final_model = trainer.train(train_ids)
         print("  Distillation complete.")
+        del teacher
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     elif config.distill and config.skip_distill:
         print("\n[5/6] Distillation: skipped (--skip-distill).")
     else:
         print("\n[5/6] Distillation: skipped (use --distill to enable).")
-
-    # Clean up teacher to free memory
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # ============================================================
     # STEP 6/6: Export to HF format

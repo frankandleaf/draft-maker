@@ -38,37 +38,55 @@ class DepthPruner:
     # ---- Phase 1: Compute BI scores ----
 
     def compute_bi_scores(self, model: nn.Module,
-                           input_ids: Tensor) -> list[float]:
+                           input_ids: Tensor,
+                           chunk_size: int = 1) -> list[float]:
         """Compute Block Influence scores for all layers.
 
         BI_i = 1 - mean_{t}(cos_sim(h_i[t], h_{i+1}[t]))
 
         where h_i[t] is the t-th token's hidden state at layer i's output.
 
+        Processes calibration data in chunks to keep GPU memory low.
+
         Args:
             model: HF model in eval mode.
             input_ids: Calibration data [num_samples, seq_len].
+            chunk_size: Samples per forward pass.
 
         Returns:
             BI scores list, length = num_layers.
         """
         num_layers = self.arch.num_layers
+        total = input_ids.shape[0]
 
-        # Collect hidden states from all layers
-        # Returns list of lists: outputs[layer_idx][batch_idx] = [seq_len, hidden_size]
-        layer_outputs = collect_layer_outputs(
-            model, input_ids,
-            layer_indices=list(range(num_layers))
-        )
+        # Accumulate pairwise cosine similarities
+        pair_cos_sum: list[float] = [0.0] * (num_layers - 1)
+        total_tokens: int = 0
 
-        # Compute BI between each adjacent pair
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            batch = input_ids[start:end]
+
+            layer_outputs = collect_layer_outputs(
+                model, batch,
+                layer_indices=list(range(num_layers))
+            )
+
+            for i in range(num_layers - 1):
+                pair_cos_sum[i] += self._compute_pair_cos_sim(
+                    layer_outputs[i],
+                    layer_outputs[i + 1],
+                )
+            total_tokens += batch.numel()
+
+        # Compute BI from accumulated cos_sim
         bi_pairs: list[float] = []
         for i in range(num_layers - 1):
-            bi = self._compute_pair_bi(
-                layer_outputs[i],    # outputs from layer i
-                layer_outputs[i + 1]  # outputs from layer i+1
-            )
-            bi_pairs.append(bi)
+            if total_tokens > 0:
+                mean_cos = pair_cos_sum[i] / total_tokens
+            else:
+                mean_cos = 1.0
+            bi_pairs.append(1.0 - mean_cos)
 
         # BI_pairs[i] is the BI between layer i and layer i+1
         # Assign each layer a BI score
@@ -123,6 +141,21 @@ class DepthPruner:
 
         mean_cos_sim = torch.cat(all_cos_sims).mean().item()
         return 1.0 - mean_cos_sim
+
+    def _compute_pair_cos_sim(self, outputs_a: list[Tensor],
+                               outputs_b: list[Tensor]) -> float:
+        """Compute sum of cosine similarities for incremental BI accumulation."""
+        all_cos_sims = []
+        for hs_a, hs_b in zip(outputs_a, outputs_b):
+            a = hs_a.float().reshape(-1, hs_a.shape[-1])
+            b = hs_b.float().reshape(-1, hs_b.shape[-1])
+            a_norm = torch.nn.functional.normalize(a, dim=-1)
+            b_norm = torch.nn.functional.normalize(b, dim=-1)
+            cos_sim = (a_norm * b_norm).sum(dim=-1)
+            all_cos_sims.append(cos_sim)
+        if not all_cos_sims:
+            return 0.0
+        return torch.cat(all_cos_sims).sum().item()
 
     # ---- Phase 2: Select layers ----
 

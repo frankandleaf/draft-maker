@@ -213,17 +213,24 @@ class SwiftSVDCompressor:
                     continue
 
                 if "q_norm.weight" in key:
-                    imp = self.head_importance.get(lidx)
-                    idx = imp.topk(t_nh).indices.sort()[0] if imp is not None \
-                        else torch.arange(t_nh, device=src[key].device)
-                    new_sd[key] = src[key].reshape(nh, hd)[idx].reshape(-1).clone()
+                    # head_dim frozen; may be [head_dim] (shared) or [nh*hd] (per-head)
+                    if src[key].numel() == hd:
+                        new_sd[key] = src[key].clone()
+                    else:
+                        imp = self.head_importance.get(lidx)
+                        idx = imp.topk(t_nh).indices.sort()[0] if imp is not None \
+                            else torch.arange(t_nh, device=src[key].device)
+                        new_sd[key] = src[key].reshape(nh, hd)[idx].reshape(-1).clone()
                     continue
 
                 if "k_norm.weight" in key:
-                    imp = self.kv_importance.get(lidx)
-                    idx = imp.topk(t_nk).indices.sort()[0] if imp is not None \
-                        else torch.arange(t_nk, device=src[key].device)
-                    new_sd[key] = src[key].reshape(nk, hd)[idx].reshape(-1).clone()
+                    if src[key].numel() == hd:
+                        new_sd[key] = src[key].clone()
+                    else:
+                        imp = self.kv_importance.get(lidx)
+                        idx = imp.topk(t_nk).indices.sort()[0] if imp is not None \
+                            else torch.arange(t_nk, device=src[key].device)
+                        new_sd[key] = src[key].reshape(nk, hd)[idx].reshape(-1).clone()
                     continue
 
             # --- FFN weights ---
