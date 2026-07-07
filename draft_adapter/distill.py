@@ -14,6 +14,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
+try:
+    import bitsandbytes as bnb
+    _AdamW8bit = bnb.optim.AdamW8bit
+except ImportError:
+    _AdamW8bit = None
+
 from .config import DistillConfig
 from .utils import load_calibration_data
 
@@ -35,8 +41,12 @@ class DistillationTrainer:
         for p in self.student.parameters():
             p.requires_grad = True
 
-        self.optimizer = torch.optim.AdamW(
-            self.student.parameters(), lr=config.learning_rate)
+        if _AdamW8bit is not None:
+            self.optimizer = _AdamW8bit(
+                self.student.parameters(), lr=config.learning_rate)
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self.student.parameters(), lr=config.learning_rate)
         self.scheduler = None
 
     # ---- Loss functions ----
