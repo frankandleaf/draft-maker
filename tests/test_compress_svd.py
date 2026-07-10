@@ -248,6 +248,27 @@ class TestSVDCompressorSliceWeight:
 class TestSVDChannelScorer:
     """Verify channel scoring logic."""
 
+    def test_score_channels_flattens_batch_and_sequence(self, monkeypatch):
+        arch = create_dummy_arch(
+            hidden_size=8, num_heads=4, num_kv=2, head_dim=2,
+            intermediate=16, num_layers=2,
+        )
+        scorer = SVDChannelScorer(arch)
+        batch_output = torch.randn(2, 3, arch.hidden_size)
+
+        def fake_collect_layer_outputs(model, input_ids, layer_indices=None):
+            return [[batch_output] for _ in layer_indices]
+
+        monkeypatch.setattr(
+            "draft_adapter.compress_svd.collect_layer_outputs",
+            fake_collect_layer_outputs,
+        )
+
+        scores = scorer.score_channels(object(), torch.ones(2, 3, dtype=torch.long))
+
+        assert scores.shape == (arch.hidden_size,)
+        assert torch.isfinite(scores).all()
+
     def test_get_channel_order_descending(self):
         arch = create_dummy_arch()
         scorer = SVDChannelScorer(arch)

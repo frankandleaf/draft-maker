@@ -106,8 +106,8 @@ class SVDChannelScorer:
 
             for layer_idx in range(num_layers):
                 for batch_output in layer_outputs[layer_idx]:
-                    # batch_output: [seq_len, d] on CPU
-                    x = batch_output.float()
+                    # Hook output is [batch, seq_len, d]; flatten all tokens.
+                    x = batch_output.float().reshape(-1, d)
                     cov_sum += x.pow(2).sum(dim=0)  # per-dim sum of squares
                     total_tokens += x.shape[0]
 
@@ -132,7 +132,7 @@ class SVDChannelScorer:
             )
             for layer_idx in range(num_layers):
                 for batch_output in layer_outputs[layer_idx]:
-                    x = batch_output.float()
+                    x = batch_output.float().reshape(-1, d)
                     full_cov += (x.T @ x)
                     count += x.shape[0]
 
