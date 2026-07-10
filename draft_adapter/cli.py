@@ -20,6 +20,7 @@ from .compress import WidthCompressor, verify_residual_consistency
 from .compress_ffn import SwiftSVDCompressor
 from .compress_svd import SVDChannelScorer, SVDCompressor, SVDDecomposer
 from .config import DepthConfig, DistillConfig, PipelineConfig, WidthConfig
+from .data import DATA_PRESETS
 from .debug_log import enable_debug, get_logger
 from .distill import DistillationTrainer
 from .export import export_to_hf
@@ -65,9 +66,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--es", type=float, default=0.5,
                    help="Embed size multiplier (0-1]")
     p.add_argument("--calibration-samples", type=int, default=16,
-                   help="Number of calibration sequences for PCA")
+                    help="Number of calibration sequences for PCA")
+    p.add_argument("--calibration-seq-len", type=int, default=512,
+                   help="Tokens per packed calibration sequence")
     p.add_argument("--rank-factor", type=float, default=0.5,
-                   help="SVD decomposition rank factor (0-1], for svd-hybrid")
+                    help="SVD decomposition rank factor (0-1], for svd-hybrid")
+
+    # Data
+    p.add_argument("--data-preset", default="public-mixed",
+                   choices=sorted(DATA_PRESETS),
+                   help="Built-in public data mix for calibration/distillation")
+    p.add_argument("--calibration-data", default=None,
+                   help="Comma-separated local paths or HF specs for calibration "
+                        "(dataset[:config[:split]])")
+    p.add_argument("--distill-data", default=None,
+                   help="Comma-separated local paths or HF specs for distillation "
+                        "(defaults to --calibration-data or --data-preset)")
+    p.add_argument("--data-source-timeout", type=int, default=30,
+                   help="Seconds before skipping a slow/unavailable data source "
+                        "(0 disables timeout)")
 
     # Depth pruning (ls)
     p.add_argument("--ls", type=float, default=0.75,
@@ -85,7 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--distill-lr", type=float, default=1e-5,
                    help="Distillation learning rate")
     p.add_argument("--distill-batch", type=int, default=4,
-                   help="Distillation batch size")
+                    help="Distillation batch size")
+    p.add_argument("--distill-prompts", type=int, default=128,
+                   help="Number of packed prompt sequences for distillation")
     p.add_argument("--kl-top-k", type=int, default=10,
                    help="Top-K for sparse KL divergence")
     p.add_argument("--kl-mode", default="reverse",
@@ -183,6 +202,9 @@ def run_pipeline(config: PipelineConfig) -> None:
         num_samples=config.width.calibration_samples,
         seq_len=config.width.calibration_seq_len,
         device=config.device,
+        data_sources=config.calibration_data,
+        data_preset=config.data_preset,
+        source_timeout=config.data_source_timeout,
     )
     print(f"  Calibration data: {calib_ids.shape[0]} seqs x "
           f"{calib_ids.shape[1]} tokens")
@@ -309,6 +331,9 @@ def run_pipeline(config: PipelineConfig) -> None:
             num_samples=config.distill.num_train_prompts,
             seq_len=config.distill.max_seq_len,
             device=config.device,
+            data_sources=config.distill_data or config.calibration_data,
+            data_preset=config.data_preset,
+            source_timeout=config.data_source_timeout,
         )
 
         # Teacher is the original model
@@ -359,6 +384,7 @@ def main():
     width_cfg = WidthConfig(
         embed_size_factor=args.es,
         calibration_samples=args.calibration_samples,
+        calibration_seq_len=args.calibration_seq_len,
         rank_factor=args.rank_factor,
     )
 
@@ -377,6 +403,7 @@ def main():
             top_k=args.kl_top_k,
             kl_mode=args.kl_mode,
             kl_temperature=args.kl_temperature,
+            num_train_prompts=args.distill_prompts,
             generate_len=args.distill_gen_len,
         )
 
@@ -395,6 +422,10 @@ def main():
         debug=args.debug,
         method=args.method,
         teacher_device=args.teacher_device,
+        data_preset=args.data_preset,
+        calibration_data=args.calibration_data,
+        distill_data=args.distill_data,
+        data_source_timeout=args.data_source_timeout,
     )
 
     run_pipeline(config)

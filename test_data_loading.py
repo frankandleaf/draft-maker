@@ -46,8 +46,8 @@ if __name__ == "__main__":
             "allenai/c4", "zh", split="train", streaming=True)),
         ("allenai/c4-en", lambda: load_dataset(
             "allenai/c4", "en", split="train", streaming=True)),
-        ("wikitext", lambda: load_dataset(
-            "wikitext", "wikitext-2-raw-v1", split="train", streaming=True)),
+        ("Salesforce/wikitext", lambda: load_dataset(
+            "Salesforce/wikitext", "wikitext-2-raw-v1", split="train", streaming=True)),
     ]
 
     print(f"\n{'='*60}")

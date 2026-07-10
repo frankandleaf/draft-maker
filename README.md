@@ -47,6 +47,43 @@ Original Model (HF)
 | `--distill` | flag | Enable on-policy distillation |
 | `--kl-mode` | reverse/forward/tvd | KL divergence type for distillation |
 
+## Calibration Data
+
+Draft-Adapter can stream public Hugging Face datasets and pack them into fixed-length token sequences for calibration/distillation.
+
+```bash
+# Online machine: export public HF data to local JSONL first
+python -m draft_adapter.data prepare \
+  --data-preset public-zh-fast \
+  --num-samples 1024 \
+  --output ./data/calib_public_zh_fast.jsonl \
+  --source-timeout 90
+
+# Offline GPU machine: read only local JSONL, no HF network needed
+draft-adapter --model Qwen/Qwen3-1.7B --method svd-hybrid \
+  --calibration-data ./data/calib_public_zh_fast.jsonl \
+  --calibration-samples 512 --calibration-seq-len 512 \
+  --output ./draft_qwen_svd --skip-distill
+
+# Chinese-first public data mix
+draft-adapter --model Qwen/Qwen3-1.7B --method svd-hybrid \
+  --data-preset public-zh-fast --calibration-samples 512 --calibration-seq-len 512 \
+  --data-source-timeout 60 --output ./draft_qwen_svd --skip-distill
+
+# Explicit public HF sources: dataset[:config[:split]]
+draft-adapter --model Qwen/Qwen3-1.7B --method svd-hybrid \
+  --calibration-data allenai/c4:zh:train,Salesforce/wikitext:wikitext-2-raw-v1:train \
+  --calibration-samples 512 --output ./draft_qwen_svd --skip-distill
+
+# Local JSONL/TXT replacement once you have real prompts
+draft-adapter --model Qwen/Qwen3-1.7B --method svd-hybrid \
+  --calibration-data ./data/calib.jsonl --distill-data ./data/distill.jsonl \
+  --distill --distill-prompts 2048 --output ./draft_qwen_svd
+```
+
+Supported local rows can contain `text`, `content`, `messages`, `conversations`, or instruction-style fields such as `instruction`, `input`, and `output`.
+Each public HF source is fetched in a short-lived subprocess; if a source is slow or unavailable, `--data-source-timeout` controls when it is skipped.
+
 ## Technical Details
 
 ### Width Compression (SliceGPT)

@@ -46,6 +46,7 @@ int4 = [
 
 [project.scripts]
 draft-adapter = "draft_adapter.cli:main"
+draft-adapter-data = "draft_adapter.data:main"
 
 [tool.setuptools.packages.find]
 include = ["draft_adapter*"]

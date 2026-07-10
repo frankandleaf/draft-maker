@@ -104,6 +104,10 @@ class PipelineConfig:
         distill: Distillation config (None = use defaults if --distill).
         skip_distill: Skip the distillation step.
         skip_benchmark: Skip the vLLM benchmark step.
+        data_preset: Built-in public data mix name.
+        calibration_data: Local paths or HF dataset specs for compression.
+        distill_data: Local paths or HF dataset specs for distillation.
+        data_source_timeout: Seconds before skipping a slow data source.
     """
 
     model: str
@@ -120,6 +124,10 @@ class PipelineConfig:
     skip_benchmark: bool = False
     debug: bool = False
     method: str = "slicegpt"
+    data_preset: str = "public-mixed"
+    calibration_data: str | None = None
+    distill_data: str | None = None
+    data_source_timeout: int = 30
 
     def __post_init__(self):
         if self.tokenizer is None:
