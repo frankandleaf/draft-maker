@@ -219,8 +219,9 @@ class SVDDecomposer:
 
         # Randomized SVD for large matrices
         if min(out_f, in_f) > 2048:
-            U, S, Vt = torch.svd_lowrank(w, q=min(target_rank * 3, max_rank),
-                                          niter=2)
+            U, S, V = torch.svd_lowrank(w, q=min(target_rank * 3, max_rank),
+                                         niter=2)
+            Vt = V.t()
         else:
             U, S, V = torch.svd(w)
             Vt = V.t()

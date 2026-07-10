@@ -152,6 +152,26 @@ class TestSVDDecomposer:
         W_recovered = mod.proj_out.weight @ mod.proj_in.weight
         assert torch.allclose(W_recovered, W, atol=1e-4)
 
+    def test_randomized_svd_transposes_v_for_wide_matrix(self, monkeypatch):
+        """torch.svd_lowrank returns V, not V^T, for large wide weights."""
+        out_f, in_f = 2049, 2050
+        decomposer = SVDDecomposer(rank_factor=0.001)
+        target_rank = max(1, int(min(out_f, in_f) * decomposer.rank_factor))
+
+        def fake_svd_lowrank(weight, q, niter):
+            assert weight.shape == (out_f, in_f)
+            return (
+                torch.randn(out_f, q),
+                torch.ones(q),
+                torch.randn(in_f, q),
+            )
+
+        monkeypatch.setattr(torch, "svd_lowrank", fake_svd_lowrank)
+        mod = decomposer.decompose_weight(torch.empty(out_f, in_f), "wide")
+
+        assert mod.proj_in.weight.shape == (target_rank, in_f)
+        assert mod.proj_out.weight.shape == (out_f, target_rank)
+
 
 class TestSVDCompressorSliceWeight:
     """Verify SVDCompressor weight slicing logic."""
