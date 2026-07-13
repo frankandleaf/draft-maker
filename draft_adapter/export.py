@@ -81,7 +81,7 @@ def export_svd_hybrid_to_hf(
     rank_map = {
         name: module.rank
         for name, module in model.named_modules()
-        if isinstance(module, DecomposedLinear)
+        if _is_decomposed_linear(module)
     }
     if not rank_map:
         raise ValueError("SVD-hybrid export requires decomposed projections")
@@ -109,6 +109,19 @@ def export_svd_hybrid_to_hf(
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"\n  SVD-hybrid draft model exported: {param_count/1e6:.1f}M parameters")
+
+
+def _is_decomposed_linear(module: torch.nn.Module) -> bool:
+    """Recognize local and Transformers dynamically-loaded factor modules."""
+    return (
+        isinstance(module, DecomposedLinear)
+        or (
+            module.__class__.__name__ == "DecomposedLinear"
+            and hasattr(module, "rank")
+            and isinstance(getattr(module, "proj_in", None), torch.nn.Linear)
+            and isinstance(getattr(module, "proj_out", None), torch.nn.Linear)
+        )
+    )
 
 
 def _build_export_config(original_config, arch: ModelArchitecture):

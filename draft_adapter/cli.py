@@ -87,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Distillation learning rate")
     p.add_argument("--distill-batch", type=int, default=4,
                    help="Distillation batch size")
+    p.add_argument("--distill-prompts", type=int, default=128,
+                   help="Number of training prompt sequences")
+    p.add_argument("--distill-seq-len", type=int, default=512,
+                   help="Tokens per distillation sequence")
     p.add_argument("--kl-top-k", type=int, default=10,
                    help="Top-K for sparse KL divergence")
     p.add_argument("--kl-mode", default="reverse",
@@ -324,10 +328,12 @@ def main():
         distill_cfg = DistillConfig(
             steps=args.distill_steps,
             batch_size=args.distill_batch,
+            max_seq_len=args.distill_seq_len,
             learning_rate=args.distill_lr,
             top_k=args.kl_top_k,
             kl_mode=args.kl_mode,
             kl_temperature=args.kl_temperature,
+            num_train_prompts=args.distill_prompts,
             generate_len=args.distill_gen_len,
         )
 

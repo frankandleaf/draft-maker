@@ -82,7 +82,7 @@ class DistillConfig:
     top_k: int = 10
     kl_temperature: float = 1.0
     kl_mode: str = "reverse"
-    num_train_prompts: int = 8192
+    num_train_prompts: int = 128
     generate_len: int = 32
 
     def __post_init__(self):

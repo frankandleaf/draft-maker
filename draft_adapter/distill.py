@@ -76,33 +76,55 @@ class DistillationTrainer:
 
     # ---- Teacher forward (no grad, compiled) ----
     @torch.no_grad()
-    def _teacher_forward(self, input_ids: Tensor) -> Tensor:
+    def _teacher_forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
         out = self.teacher(
             input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids, device=input_ids.device),
+            attention_mask=attention_mask,
         )
         return out.logits.detach()
 
     # ---- Phase 1: Off-policy recovery (teacher generates, student imitates) ----
 
-    def train_step_recovery(self, prompt_ids: Tensor) -> dict:
+    def train_step_recovery(
+        self,
+        prompt_ids: Tensor,
+        prompt_attention_mask: Tensor,
+    ) -> dict:
         """Teacher generates; student learns to match on teacher's tokens."""
         gen_len = self.config.generate_len
         device = prompt_ids.device
 
         # Teacher generates high-quality tokens
         teacher_gen = self.teacher.generate(
-            prompt_ids, max_new_tokens=gen_len, do_sample=True,
+            prompt_ids,
+            attention_mask=prompt_attention_mask,
+            max_new_tokens=gen_len, do_sample=True,
             temperature=1.0,
             pad_token_id=self.tokenizer.pad_token_id
                          or self.tokenizer.eos_token_id,
         )
         full_ids = teacher_gen[:, :prompt_ids.shape[1] + gen_len]
+        generated_len = full_ids.shape[1] - prompt_ids.shape[1]
+        full_attention_mask = torch.cat(
+            [
+                prompt_attention_mask,
+                torch.ones(
+                    prompt_ids.shape[0], generated_len,
+                    device=prompt_ids.device,
+                    dtype=prompt_attention_mask.dtype,
+                ),
+            ],
+            dim=1,
+        )
 
         # Student forward, CE on generated tokens only
         student_out = self.student(
             input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids, device=full_ids.device),
+            attention_mask=full_attention_mask,
         )
         student_logits = student_out.logits  # [batch, seq, vocab]
 
@@ -125,7 +147,11 @@ class DistillationTrainer:
 
     # ---- Phase 2: On-policy speculative (student generates, teacher scores) ----
 
-    def train_step_speculative(self, prompt_ids: Tensor) -> dict:
+    def train_step_speculative(
+        self,
+        prompt_ids: Tensor,
+        prompt_attention_mask: Tensor,
+    ) -> dict:
         """Student generates; teacher scores → top-K KL on student's tokens."""
         gen_len = min(self.config.generate_len, 32)
         device = prompt_ids.device
@@ -134,7 +160,9 @@ class DistillationTrainer:
         self.student.eval()
         with torch.no_grad():
             student_gen = self.student.generate(
-                prompt_ids, max_new_tokens=gen_len, do_sample=True,
+                prompt_ids,
+                attention_mask=prompt_attention_mask,
+                max_new_tokens=gen_len, do_sample=True,
                 temperature=1.0,
                 pad_token_id=self.tokenizer.pad_token_id
                              or self.tokenizer.eos_token_id,
@@ -142,12 +170,27 @@ class DistillationTrainer:
         self.student.train()
 
         full_ids = student_gen[:, :prompt_ids.shape[1] + gen_len]
+        generated_len = full_ids.shape[1] - prompt_ids.shape[1]
+        full_attention_mask = torch.cat(
+            [
+                prompt_attention_mask,
+                torch.ones(
+                    prompt_ids.shape[0], generated_len,
+                    device=prompt_ids.device,
+                    dtype=prompt_attention_mask.dtype,
+                ),
+            ],
+            dim=1,
+        )
 
         # Teacher scores + student forward on student-generated tokens
-        teacher_logits = self._teacher_forward(full_ids)
+        teacher_logits = self._teacher_forward(
+            full_ids,
+            attention_mask=full_attention_mask,
+        )
         student_out = self.student(
             input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids, device=full_ids.device),
+            attention_mask=full_attention_mask,
         )
         student_logits = student_out.logits
 
@@ -170,6 +213,22 @@ class DistillationTrainer:
 
     # ---- Full training loop ----
 
+    @staticmethod
+    def _left_pad_prompts(
+        prompt_ids: Tensor,
+        pad_token_id: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Move right padding to the left for decoder-only generation."""
+        attention_mask = prompt_ids.ne(pad_token_id)
+        left_padded = torch.full_like(prompt_ids, pad_token_id)
+        left_mask = torch.zeros_like(prompt_ids)
+        for row in range(prompt_ids.shape[0]):
+            tokens = prompt_ids[row][attention_mask[row]]
+            if tokens.numel():
+                left_padded[row, -tokens.numel():] = tokens
+                left_mask[row, -tokens.numel():] = 1
+        return left_padded, left_mask
+
     def train(self, train_input_ids: Tensor) -> torch.nn.Module:
         total = self.config.steps
         bs = self.config.batch_size
@@ -186,11 +245,21 @@ class DistillationTrainer:
             # Prompt = first half, student/teacher generates second half
             prompt_len = batch.shape[1] // 2
             prompts = batch[:, :prompt_len]
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.tokenizer.eos_token_id
+            prompts, prompt_attention_mask = self._left_pad_prompts(
+                prompts, pad_token_id,
+            )
 
             if step < rec_steps:
-                metrics = self.train_step_recovery(prompts)
+                metrics = self.train_step_recovery(
+                    prompts, prompt_attention_mask,
+                )
             else:
-                metrics = self.train_step_speculative(prompts)
+                metrics = self.train_step_speculative(
+                    prompts, prompt_attention_mask,
+                )
 
             losses.append(metrics["loss"])
             self.scheduler.step()

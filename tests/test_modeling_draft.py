@@ -82,6 +82,12 @@ def test_svd_hybrid_round_trip_uses_custom_class(tmp_path):
     generated = loaded.generate(inputs, max_new_tokens=2, do_sample=False)
     assert generated.shape == (1, 5)
 
+    second_export = tmp_path / "second_export"
+    export_svd_hybrid_to_hf(
+        loaded, arch, _TokenizerStub(), str(second_export),
+    )
+    assert (second_export / "model.safetensors").exists()
+
 
 def test_required_svd_hybrid_rejects_dense_official_model():
     dense_model = SimpleNamespace(config=SimpleNamespace())
