@@ -563,6 +563,10 @@ class SVDCompressor:
 
                 decomp = self.decomposer.decompose_weight(
                     w, f"L{i}.attn.{name}", bias=bias)
+                if sum(p.numel() for p in decomp.parameters()) >= w.numel() + (
+                    bias.numel() if bias is not None else 0
+                ):
+                    continue
                 setattr(layer.self_attn, name, decomp)
 
                 original_params += w.numel()
@@ -579,6 +583,8 @@ class SVDCompressor:
 
                 decomp = self.decomposer.decompose_weight(w,
                                                           f"L{i}.mlp.{name}")
+                if sum(p.numel() for p in decomp.parameters()) >= w.numel():
+                    continue
                 setattr(layer.mlp, name, decomp)
 
                 original_params += w.numel()

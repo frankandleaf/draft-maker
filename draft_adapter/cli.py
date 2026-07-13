@@ -16,7 +16,8 @@ from transformers import AutoConfig
 from . import __version__
 from .calibration import compute_global_covariance
 from .compress import WidthCompressor, verify_residual_consistency
-from .compress_svd import SVDChannelScorer, SVDCompressor, SVDDecomposer
+from .compress_ffn import SwiftSVDCompressor
+from .compress_svd import SVDCompressor, SVDDecomposer
 from .config import DepthConfig, DistillConfig, PipelineConfig, WidthConfig
 from .debug_log import enable_debug, get_logger
 from .distill import DistillationTrainer
@@ -134,6 +135,19 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("\n[1/6] Inspecting model architecture...")
     arch = inspect_model(config.model)
     arch = compute_targets(arch, config.width, config.depth)
+    if config.method == "svd-hybrid":
+        groups = arch.num_kv_groups
+        arch.target_embed_dim = arch.hidden_size
+        arch.target_num_heads = max(
+            groups,
+            int(arch.num_attention_heads * config.width.head_size_factor),
+        )
+        arch.target_num_heads = (arch.target_num_heads // groups) * groups
+        arch.target_num_kv_heads = arch.target_num_heads // groups
+        arch.target_intermediate_size = max(
+            8,
+            int(arch.intermediate_size * config.width.embed_size_factor),
+        )
 
     print(f"  Model type: {arch.model_type}")
     print(f"  Original: {arch.num_layers}L, {arch.hidden_size}d, "
@@ -181,12 +195,12 @@ def run_pipeline(config: PipelineConfig) -> None:
           f"{calib_ids.shape[1]} tokens")
 
     if config.method == "svd-hybrid":
-        print("\n[2b/6] SVD channel scoring...")
-        scorer = SVDChannelScorer(arch)
-        scorer.score_channels(model, calib_ids)
-        print("\n[3/6] SVD channel slicing...")
-        compressor = SVDCompressor(arch, scorer=scorer)
-        compressed_model = compressor.compress(model, original_config)
+        print("\n[2b/6] Scoring attention heads and FFN neurons...")
+        compressor = SwiftSVDCompressor(arch)
+        compressor.compute_head_importance(model, calib_ids)
+        compressor.compute_ffn_importance(model, calib_ids)
+        print("\n[3/6] Importance-aware head and FFN pruning...")
+        compressed_model, _ = compressor.prune(model, original_config)
     else:
         print("  Computing global covariance matrix...")
         aggregator = compute_global_covariance(

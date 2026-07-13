@@ -71,10 +71,10 @@ def test_svd_hybrid_round_trip_uses_custom_class(tmp_path):
     )
 
     assert loaded.__class__.__name__ == "DraftQwen3ForCausalLM"
-    q_proj = loaded.model.layers[0].self_attn.q_proj
-    assert q_proj.__class__.__name__ == "DecomposedLinear"
-    assert q_proj.rank == 16
-    assert q_proj.proj_in.weight.shape == (16, 32)
+    gate_proj = loaded.model.layers[0].mlp.gate_proj
+    assert gate_proj.__class__.__name__ == "DecomposedLinear"
+    assert gate_proj.rank == 16
+    assert gate_proj.proj_in.weight.shape == (16, 32)
     inputs = torch.tensor([[1, 2, 3]])
     output = loaded(inputs, use_cache=True)
     assert output.logits.shape == (1, 3, 64)
