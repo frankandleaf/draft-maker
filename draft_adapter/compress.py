@@ -54,10 +54,8 @@ def _absorb_norms(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, T
       model.norm          →  lm_head
 
     After absorption, all norm weights become ones.
-
-    NOTE: modifies state_dict IN PLACE to avoid cloning the entire dict
-    (which doubles GPU memory for large models).
     """
+    sd = {k: v.clone() for k, v in state_dict.items()}
     log = get_logger()
 
     log.section("Norm Absorption: fusing RMSNorm γ → adjacent Linear weights")
@@ -68,38 +66,36 @@ def _absorb_norms(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, T
 
         # input_layernorm → q_proj, k_proj, v_proj
         in_ln_key = f"{prefix}.input_layernorm.weight"
-        if in_ln_key in state_dict:
-            gamma = state_dict[in_ln_key]
+        if in_ln_key in sd:
+            gamma = sd[in_ln_key]
             log.before(f"L{i} input_layernorm → q/k/v",
                        gamma_norm=gamma.float().norm(), gamma_len=gamma.shape[0])
-            scale = gamma.unsqueeze(0)
             for proj in ["q_proj", "k_proj", "v_proj"]:
                 w_key = f"{prefix}.self_attn.{proj}.weight"
-                if w_key in state_dict:
-                    w_before = state_dict[w_key].clone()
-                    state_dict[w_key].mul_(scale)
-                    log.weight_diff(f"L{i}.{proj}", w_before, state_dict[w_key])
-            state_dict[in_ln_key] = torch.ones_like(gamma)
+                if w_key in sd:
+                    w_before = sd[w_key].clone()
+                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
+                    log.weight_diff(f"L{i}.{proj}", w_before, sd[w_key])
+            sd[in_ln_key] = torch.ones_like(gamma)
             log.info("  → γ set to ones")
 
         # post_attention_layernorm → gate_proj, up_proj
         post_ln_key = f"{prefix}.post_attention_layernorm.weight"
-        if post_ln_key in state_dict:
-            gamma = state_dict[post_ln_key]
-            scale = gamma.unsqueeze(0)
+        if post_ln_key in sd:
+            gamma = sd[post_ln_key]
             for proj in ["gate_proj", "up_proj"]:
                 w_key = f"{prefix}.mlp.{proj}.weight"
-                if w_key in state_dict:
-                    state_dict[w_key].mul_(scale)
-            state_dict[post_ln_key] = torch.ones_like(gamma)
+                if w_key in sd:
+                    sd[w_key] = sd[w_key] * gamma.unsqueeze(0)
+            sd[post_ln_key] = torch.ones_like(gamma)
 
     # model.norm → lm_head
-    if "model.norm.weight" in state_dict and "lm_head.weight" in state_dict:
-        gamma = state_dict["model.norm.weight"]
-        state_dict["lm_head.weight"].mul_(gamma.unsqueeze(0))
-        state_dict["model.norm.weight"] = torch.ones_like(gamma)
+    if "model.norm.weight" in sd and "lm_head.weight" in sd:
+        gamma = sd["model.norm.weight"]
+        sd["lm_head.weight"] = sd["lm_head.weight"] * gamma.unsqueeze(0)
+        sd["model.norm.weight"] = torch.ones_like(gamma)
 
-    return state_dict
+    return sd
 
 
 # --- State dict key patterns and their projection rules ---
@@ -328,39 +324,16 @@ class WidthCompressor:
         # This MUST happen before PCA projection. See docstring for proof.
         state_dict = _absorb_norms(state_dict, target.num_layers)
 
-        # ---- Move model to CPU to free GPU memory for projected weights ----
-        q_device = self.Q_top.device
-        original_model.cpu()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Build target config + model first, then project weights
-        # layer-by-layer directly into it — no intermediate new_state_dict
+        # Build target config
         target_config = self._build_target_config(original_config)
 
-        with torch.no_grad():
-            compressed_model = AutoModelForCausalLM.from_config(
-                target_config,
-                torch_dtype=original_model.dtype,
-            )
-        target_sd = compressed_model.state_dict()
-
+        # Project all weights
+        new_state_dict: dict[str, Tensor] = {}
         skipped_keys: list[str] = []
-        rule_counts: dict[str, int] = {}
 
         for key, weight in tqdm(state_dict.items(), desc="Projecting weights"):
-            if key not in target_sd:
-                skipped_keys.append(key)
-                continue
             try:
-                projected = self._project_weight(
-                    weight.to(q_device) if weight.device.type != 'cuda' else weight,
-                    key,
-                )
-                target_sd[key].copy_(projected.to(target_sd[key].dtype))
-                del projected
-                rule_counts[_get_projection_rule(key)] = \
-                    rule_counts.get(_get_projection_rule(key), 0) + 1
+                new_state_dict[key] = self._project_weight(weight, key)
             except Exception as e:
                 print(f"  Warning: skipping {key} ({e})")
                 skipped_keys.append(key)
@@ -368,20 +341,44 @@ class WidthCompressor:
         if skipped_keys:
             print(f"  Skipped {len(skipped_keys)} keys: {skipped_keys}")
 
-        # Handle tied embeddings: copy projected embed_tokens -> lm_head
-        tied = getattr(original_config, "tie_word_embeddings", False)
-        if tied and "lm_head.weight" in target_sd:
-            target_sd["lm_head.weight"].copy_(
-                target_sd["model.embed_tokens.weight"]
-            )
-            print("  Untied embeddings: copied embed_tokens.weight → lm_head.weight")
-
+        # Count projected weights by rule
         log = get_logger()
+        rule_counts: dict[str, int] = {}
+        for key in new_state_dict:
+            rule_counts[_get_projection_rule(key)] = \
+                rule_counts.get(_get_projection_rule(key), 0) + 1
         log.section("Weight Projection Summary")
         for rule, count in sorted(rule_counts.items()):
             log.info(f"  {rule}: {count} weights")
 
-        return compressed_model, {}
+        # Handle tied embeddings: if original had tie_word_embeddings=True,
+        # the state dict has no lm_head.weight. The target config has
+        # tie_word_embeddings=False, so we must provide lm_head.weight
+        # explicitly (copy from projected embed_tokens).
+        tied = getattr(original_config, "tie_word_embeddings", False)
+        if tied and "lm_head.weight" not in new_state_dict:
+            if "model.embed_tokens.weight" in new_state_dict:
+                new_state_dict["lm_head.weight"] = new_state_dict[
+                    "model.embed_tokens.weight"].clone()
+                print("  Untied embeddings: copied embed_tokens.weight → lm_head.weight")
+
+        # Create new model with target config
+        with torch.no_grad():
+            compressed_model = AutoModelForCausalLM.from_config(
+                target_config,
+                torch_dtype=original_model.dtype,
+            )
+
+        # Load projected weights (strict=False handles missing/mismatched keys)
+        missing, unexpected = compressed_model.load_state_dict(
+            new_state_dict, strict=False
+        )
+        if missing:
+            print(f"  Missing keys: {missing}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
+
+        return compressed_model, new_state_dict
 
     def _build_target_config(self, original_config):
         """Create a config for the compressed model (deep copy from original)."""

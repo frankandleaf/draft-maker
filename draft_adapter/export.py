@@ -6,12 +6,14 @@ with vLLM's speculative_model parameter.
 
 import copy
 import os
+import shutil
 
 import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 from .inspect import ModelArchitecture
+from .modeling_draft import DecomposedLinear
 
 
 def export_to_hf(
@@ -60,7 +62,53 @@ def export_to_hf(
     print(f"\n  Draft model exported: {param_count/1e6:.1f}M parameters")
     print(f"  Architecture: {t.model_type}, {t.target_num_layers} layers, "
           f"{t.target_embed_dim}d, {t.target_num_heads}H/{t.target_num_kv_heads}KV, "
-          f"{t.target_head_dim}hd ")
+           f"{t.target_head_dim}hd ")
+
+
+def export_svd_hybrid_to_hf(
+    model: torch.nn.Module,
+    arch: ModelArchitecture,
+    tokenizer,
+    output_dir: str,
+) -> None:
+    """Export a factorized Qwen3 model with its custom loading class."""
+    if arch.model_type != "qwen3":
+        raise ValueError(
+            "SVD-hybrid custom export currently supports only Qwen3, got "
+            f"{arch.model_type}"
+        )
+
+    rank_map = {
+        name: module.rank
+        for name, module in model.named_modules()
+        if isinstance(module, DecomposedLinear)
+    }
+    if not rank_map:
+        raise ValueError("SVD-hybrid export requires decomposed projections")
+
+    os.makedirs(output_dir, exist_ok=True)
+    config = copy.deepcopy(model.config)
+    config.architectures = ["DraftQwen3ForCausalLM"]
+    config.auto_map = {
+        "AutoModelForCausalLM": "modeling_draft.DraftQwen3ForCausalLM",
+    }
+    config.svd_rank_map = rank_map
+    config._draft_adapter = {
+        "method": "svd-hybrid",
+        "original_model_type": arch.model_type,
+    }
+    config.save_pretrained(output_dir)
+
+    weights_path = os.path.join(output_dir, "model.safetensors")
+    save_file(_prepare_state_dict(model), weights_path)
+
+    source_path = os.path.join(os.path.dirname(__file__), "modeling_draft.py")
+    shutil.copyfile(source_path, os.path.join(output_dir, "modeling_draft.py"))
+    _copy_tokenizer(tokenizer, output_dir)
+    _verify_export(output_dir, tokenizer, expected_class="DraftQwen3ForCausalLM")
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"\n  SVD-hybrid draft model exported: {param_count/1e6:.1f}M parameters")
 
 
 def _build_export_config(original_config, arch: ModelArchitecture):
@@ -103,15 +151,24 @@ def _copy_tokenizer(tokenizer, output_dir: str) -> None:
     tokenizer.save_pretrained(output_dir)
 
 
-def _verify_export(output_dir: str, tokenizer) -> None:
+def _verify_export(
+    output_dir: str,
+    tokenizer,
+    expected_class: str | None = None,
+) -> None:
     """Verify the exported model can be loaded and produces output."""
     try:
         loaded = AutoModelForCausalLM.from_pretrained(
             output_dir,
             torch_dtype=torch.float32,
             device_map="cpu",
+            trust_remote_code=True,
         )
         loaded.eval()
+        if expected_class is not None:
+            assert loaded.__class__.__name__ == expected_class, (
+                f"loaded {loaded.__class__.__name__}, expected {expected_class}"
+            )
 
         # Simple forward pass
         dummy = torch.randint(0, min(tokenizer.vocab_size, 1000), (1, 8))
@@ -128,7 +185,6 @@ def _verify_export(output_dir: str, tokenizer) -> None:
         print(f"  Round-trip verification passed (logits: {list(output.logits.shape)})")
 
     except Exception as e:
-        import traceback
-        print(f"  Warning: round-trip verification failed: {e}")
-        traceback.print_exc()
-        print(f"  The model files are saved but may need manual inspection.")
+        raise RuntimeError(
+            f"Exported model failed round-trip verification: {e}"
+        ) from e

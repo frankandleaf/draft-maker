@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 MODEL = "Qwen/Qwen3-1.7B"
 
 
-def test_source(name: str, loader_fn, tokenizer, num_samples=4, seq_len=32):
+def check_source(name: str, loader_fn, tokenizer, num_samples=4, seq_len=32):
     """Test a single data source. Returns (ok, first_text)."""
     try:
         ds = loader_fn()
@@ -46,8 +46,8 @@ if __name__ == "__main__":
             "allenai/c4", "zh", split="train", streaming=True)),
         ("allenai/c4-en", lambda: load_dataset(
             "allenai/c4", "en", split="train", streaming=True)),
-        ("Salesforce/wikitext", lambda: load_dataset(
-            "Salesforce/wikitext", "wikitext-2-raw-v1", split="train", streaming=True)),
+        ("wikitext", lambda: load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="train", streaming=True)),
     ]
 
     print(f"\n{'='*60}")
@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     any_ok = False
     for name, loader in sources:
-        ok, msg, shape = test_source(name, loader, tok)
+        ok, msg, shape = check_source(name, loader, tok)
         status = "✓ OK" if ok else "✗ FAIL"
         print(f"\n{status}  {name}")
         if ok:

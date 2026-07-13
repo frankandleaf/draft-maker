@@ -6,7 +6,7 @@
 
 工作：
 1. 接受原模型与tokenizer，获取head dim，head size等模型信息。**放弃“任意nn.Module”的设想**，首版锁定标准GQA Decoder架构，明确不支持MLA/MoE/Mamba等非标结构。
-2. 设置es因子，对embed_dim和FFN中间维度做整除，得到新草稿模型结构。head_dim保持冻结以确保RoPE兼容性。
+2. 设置hd, hs, es因子，对head dim, head size, embed/lm_head做整除，得到新草稿模型结构。需校验hs缩放与GQA num_kv_heads的兼容性。
 3. **放弃逐层独立SVD**（会破坏残差流维度一致性导致模型崩溃）。采用SliceGPT风格正交投影+切片，或仅在FFN中间维（SwiGLU）做激活感知低秩分解。计算时采用Swift-SVD的增量协方差聚合策略，将显存开销降到最低。
 4. 设置ls因子。**放弃迭代贪心删“相似度最高层”**（非全局最优且重算成本高）。采用ShortGPT的Block Influence(BI)全局排序，保护首尾层，直接一次性裁剪至目标层数。删层后需显式处理hidden states偏移。
 5. 设置训练器进行蒸馏。主损失采用on-policy的top-K稀疏KL散度，辅以AdaSpec风格的token过滤与相对排序蒸馏。**打破显存瓶颈的关键在Teacher**：Teacher侧可选使用FP8/INT4量化推理。

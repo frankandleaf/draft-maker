@@ -194,6 +194,13 @@ def benchmark_speculative(
         device_map=device,
         trust_remote_code=True,
     )
+    adapter_metadata = getattr(draft.config, "_draft_adapter", {})
+    if adapter_metadata.get("method") == "svd-hybrid":
+        if draft.__class__.__name__ != "DraftQwen3ForCausalLM":
+            raise RuntimeError(
+                "SVD-hybrid draft loaded with "
+                f"{draft.__class__.__name__}; expected DraftQwen3ForCausalLM"
+            )
     tokenizer = AutoTokenizer.from_pretrained(draft_model_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

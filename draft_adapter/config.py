@@ -11,27 +11,31 @@ class WidthConfig:
     Width reduction is absorbed entirely by num_heads.
 
     Attributes:
-        embed_size_factor: Scales hidden_size / embed_dim and intermediate_size.
+        head_dim_factor: (DEPRECATED, kept for CLI compat) Ignored.
+        head_size_factor: Scales num_heads (and num_kv_heads for GQA).
+        embed_size_factor: Scales hidden_size / embed_dim.
         calibration_samples: Number of calibration sequences for PCA.
         calibration_seq_len: Max tokens per calibration sequence.
-        rank_factor: For svd-hybrid method: fraction of rank to keep
-                     in SVD decomposition step. Range (0, 1].
+        rank_factor: Rank retained by SVD-hybrid projection decomposition.
     """
 
+    head_dim_factor: float = 0.5   # DEPRECATED: head_dim is frozen
+    head_size_factor: float = 0.5
     embed_size_factor: float = 0.5
     calibration_samples: int = 16
     calibration_seq_len: int = 512
     rank_factor: float = 0.5
 
     def __post_init__(self):
-        if not 0 < self.embed_size_factor <= 1:
-            raise ValueError(
-                f"embed_size_factor must be in (0, 1], got {self.embed_size_factor}"
-            )
-        if not 0 < self.rank_factor <= 1:
-            raise ValueError(
-                f"rank_factor must be in (0, 1], got {self.rank_factor}"
-            )
+        for name in (
+            "head_dim_factor",
+            "head_size_factor",
+            "embed_size_factor",
+            "rank_factor",
+        ):
+            v = getattr(self, name)
+            if not 0 < v <= 1:
+                raise ValueError(f"{name} must be in (0, 1], got {v}")
 
 
 @dataclass
@@ -44,7 +48,7 @@ class DepthConfig:
         protect_last: Number of final layers always kept.
     """
 
-    layer_factor: float = 0.75  # es*ls = 0.5*0.75 ≈ 0.375
+    layer_factor: float = 0.75  # hd*hs*es*ls = 0.5*0.5*0.5*0.75 ≈ 0.094 → ~9.4%
     protect_first: int = 1
     protect_last: int = 1
 
@@ -78,7 +82,7 @@ class DistillConfig:
     top_k: int = 10
     kl_temperature: float = 1.0
     kl_mode: str = "reverse"
-    num_train_prompts: int = 128
+    num_train_prompts: int = 8192
     generate_len: int = 32
 
     def __post_init__(self):
@@ -104,10 +108,6 @@ class PipelineConfig:
         distill: Distillation config (None = use defaults if --distill).
         skip_distill: Skip the distillation step.
         skip_benchmark: Skip the vLLM benchmark step.
-        data_preset: Built-in public data mix name.
-        calibration_data: Local paths or HF dataset specs for compression.
-        distill_data: Local paths or HF dataset specs for distillation.
-        data_source_timeout: Seconds before skipping a slow data source.
     """
 
     model: str
@@ -116,7 +116,6 @@ class PipelineConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     seed: int = 42
-    teacher_device: str | None = None
     width: WidthConfig = field(default_factory=WidthConfig)
     depth: DepthConfig = field(default_factory=DepthConfig)
     distill: DistillConfig | None = None
@@ -124,11 +123,11 @@ class PipelineConfig:
     skip_benchmark: bool = False
     debug: bool = False
     method: str = "slicegpt"
-    data_preset: str = "public-mixed"
-    calibration_data: str | None = None
-    distill_data: str | None = None
-    data_source_timeout: int = 30
 
     def __post_init__(self):
         if self.tokenizer is None:
             self.tokenizer = self.model
+        if self.method not in ("slicegpt", "svd-hybrid"):
+            raise ValueError(
+                f"method must be 'slicegpt' or 'svd-hybrid', got {self.method}"
+            )

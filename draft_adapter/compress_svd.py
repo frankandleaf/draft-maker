@@ -27,30 +27,12 @@ from transformers import AutoModelForCausalLM
 from .calibration import collect_layer_outputs
 from .debug_log import get_logger
 from .inspect import ModelArchitecture
+from .modeling_draft import DecomposedLinear
 
 
 # ============================================================================
 # DecomposedLinear: replaces nn.Linear with two low-rank linear layers
 # ============================================================================
-
-
-class DecomposedLinear(nn.Module):
-    """Low-rank decomposition of nn.Linear W[m,n] ≈ W_out[m,r] @ W_in[r,n].
-
-    W = U @ S @ V^T  →  W_out = U @ diag(sqrt(S)),  W_in = diag(sqrt(S)) @ V^T
-    """
-
-    def __init__(self, in_features: int, out_features: int, rank: int,
-                 bias: bool = False):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.proj_in = nn.Linear(in_features, rank, bias=False)
-        self.proj_out = nn.Linear(rank, out_features, bias=bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.proj_out(self.proj_in(x))
 
 
 # ============================================================================
@@ -236,8 +218,12 @@ class SVDDecomposer:
         W_out = U_r * S_sqrt.unsqueeze(0)      # [out_f, r]
         W_in = Vt_r * S_sqrt.unsqueeze(1)       # [r, in_f]
 
-        mod = DecomposedLinear(in_f, out_f, target_rank,
-                               bias=(bias is not None))
+        mod = DecomposedLinear(
+            in_f,
+            out_f,
+            target_rank,
+            bias=(bias is not None),
+        ).to(device=weight.device, dtype=weight.dtype)
         mod.proj_in.weight.data.copy_(W_in)
         mod.proj_out.weight.data.copy_(W_out)
         if bias is not None:

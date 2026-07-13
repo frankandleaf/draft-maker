@@ -121,6 +121,18 @@ class TestSVDDecomposer:
         out = mod(x)
         assert out.shape == (2, 8, d_out)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_decompose_preserves_cuda_device_and_dtype(self):
+        decomposer = SVDDecomposer(rank_factor=0.5)
+        weight = torch.randn(32, 16, device="cuda", dtype=torch.float16)
+
+        mod = decomposer.decompose_weight(weight, "cuda")
+
+        assert mod.proj_in.weight.device.type == "cuda"
+        assert mod.proj_in.weight.dtype == torch.float16
+        output = mod(torch.randn(2, 16, device="cuda", dtype=torch.float16))
+        assert output.shape == (2, 32)
+
     def test_rank_factor_one(self):
         """rank_factor=1 means full rank decomposition."""
         decomposer = SVDDecomposer(rank_factor=1.0)
