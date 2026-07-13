@@ -17,6 +17,21 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def _validate_draft_model(draft_model, require_svd_hybrid: bool = False) -> None:
+    metadata = getattr(draft_model.config, "_draft_adapter", {})
+    is_svd_hybrid = metadata.get("method") == "svd-hybrid"
+    if require_svd_hybrid and not is_svd_hybrid:
+        raise RuntimeError(
+            "Draft model is not an SVD-hybrid export; regenerate it with "
+            "--method svd-hybrid"
+        )
+    if is_svd_hybrid and draft_model.__class__.__name__ != "DraftQwen3ForCausalLM":
+        raise RuntimeError(
+            "SVD-hybrid draft loaded with "
+            f"{draft_model.__class__.__name__}; expected DraftQwen3ForCausalLM"
+        )
+
+
 @torch.no_grad()
 def speculative_generate(
     target_model,
@@ -176,6 +191,7 @@ def benchmark_speculative(
     num_speculative_tokens: int = 5,
     temperature: float = 0.0,
     device: str = "cuda",
+    require_svd_hybrid: bool = False,
 ) -> dict:
     """Run speculative decoding benchmark comparing target-only vs speculative.
 
@@ -194,13 +210,7 @@ def benchmark_speculative(
         device_map=device,
         trust_remote_code=True,
     )
-    adapter_metadata = getattr(draft.config, "_draft_adapter", {})
-    if adapter_metadata.get("method") == "svd-hybrid":
-        if draft.__class__.__name__ != "DraftQwen3ForCausalLM":
-            raise RuntimeError(
-                "SVD-hybrid draft loaded with "
-                f"{draft.__class__.__name__}; expected DraftQwen3ForCausalLM"
-            )
+    _validate_draft_model(draft, require_svd_hybrid=require_svd_hybrid)
     tokenizer = AutoTokenizer.from_pretrained(draft_model_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

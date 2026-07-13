@@ -1,11 +1,14 @@
 """Round-trip tests for the SVD-hybrid Qwen3 loading class."""
 
 import json
+from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 from draft_adapter.compress_svd import SVDCompressor, SVDDecomposer
+from draft_adapter.benchmark import _validate_draft_model
 from draft_adapter.export import export_svd_hybrid_to_hf
 from draft_adapter.inspect import ModelArchitecture
 
@@ -78,3 +81,18 @@ def test_svd_hybrid_round_trip_uses_custom_class(tmp_path):
     assert output.past_key_values is not None
     generated = loaded.generate(inputs, max_new_tokens=2, do_sample=False)
     assert generated.shape == (1, 5)
+
+
+def test_required_svd_hybrid_rejects_dense_official_model():
+    dense_model = SimpleNamespace(config=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="not an SVD-hybrid export"):
+        _validate_draft_model(dense_model, require_svd_hybrid=True)
+
+
+def test_svd_hybrid_rejects_official_qwen3_class():
+    class Qwen3ForCausalLM:
+        config = SimpleNamespace(_draft_adapter={"method": "svd-hybrid"})
+
+    with pytest.raises(RuntimeError, match="expected DraftQwen3ForCausalLM"):
+        _validate_draft_model(Qwen3ForCausalLM())
