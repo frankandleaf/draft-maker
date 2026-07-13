@@ -58,6 +58,10 @@ class TestDistillConfig:
         with pytest.raises(ValueError):
             DistillConfig(top_k=0)
 
+    def test_negative_hard_label_weight(self):
+        with pytest.raises(ValueError, match="hard_label_weight"):
+            DistillConfig(hard_label_weight=-0.1)
+
 
 class TestPipelineConfig:
     def test_tokenizer_defaults_to_model(self):

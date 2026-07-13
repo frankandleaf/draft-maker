@@ -98,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="KL divergence mode")
     p.add_argument("--kl-temperature", type=float, default=1.0,
                    help="Temperature for KL divergence")
+    p.add_argument("--hard-label-weight", type=float, default=1.0,
+                   help="Teacher-argmax CE weight during on-policy distillation")
     p.add_argument("--distill-gen-len", type=int, default=32,
                    help="Tokens student generates per step")
 
@@ -333,6 +335,7 @@ def main():
             top_k=args.kl_top_k,
             kl_mode=args.kl_mode,
             kl_temperature=args.kl_temperature,
+            hard_label_weight=args.hard_label_weight,
             num_train_prompts=args.distill_prompts,
             generate_len=args.distill_gen_len,
         )

@@ -71,6 +71,7 @@ class DistillConfig:
         top_k: Top-K for sparse KL divergence.
         kl_temperature: Temperature for softening logits.
         kl_mode: "reverse", "forward", or "tvd".
+        hard_label_weight: Weight for teacher-argmax cross entropy.
         num_train_prompts: Number of training prompts.
         generate_len: Number of tokens student generates per step.
     """
@@ -82,6 +83,7 @@ class DistillConfig:
     top_k: int = 10
     kl_temperature: float = 1.0
     kl_mode: str = "reverse"
+    hard_label_weight: float = 1.0
     num_train_prompts: int = 128
     generate_len: int = 32
 
@@ -90,6 +92,11 @@ class DistillConfig:
             raise ValueError(f"kl_mode must be 'reverse', 'forward', or 'tvd', got {self.kl_mode}")
         if self.top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {self.top_k}")
+        if self.hard_label_weight < 0:
+            raise ValueError(
+                "hard_label_weight must be >= 0, got "
+                f"{self.hard_label_weight}"
+            )
 
 
 @dataclass

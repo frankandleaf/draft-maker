@@ -102,8 +102,8 @@ class DistillationTrainer:
         teacher_gen = self.teacher.generate(
             prompt_ids,
             attention_mask=prompt_attention_mask,
-            max_new_tokens=gen_len, do_sample=True,
-            temperature=1.0,
+            max_new_tokens=gen_len,
+            do_sample=False,
             pad_token_id=self.tokenizer.pad_token_id
                          or self.tokenizer.eos_token_id,
         )
@@ -198,18 +198,29 @@ class DistillationTrainer:
         t_logits = teacher_logits[:, prompt_ids.shape[1]-1:-1, :]
         s_logits = student_logits[:, prompt_ids.shape[1]-1:-1, :]
 
-        loss = self.top_k_kl(
+        kl_loss = self.top_k_kl(
             s_logits, t_logits,
             k=self.config.top_k, T=self.config.kl_temperature,
             mode=self.config.kl_mode,
         )
+        hard_targets = t_logits.argmax(dim=-1)
+        hard_loss = F.cross_entropy(
+            s_logits.reshape(-1, s_logits.shape[-1]),
+            hard_targets.reshape(-1),
+        )
+        loss = kl_loss + self.config.hard_label_weight * hard_loss
 
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
         self.optimizer.step()
 
-        return {"loss": loss.item(), "phase": "speculative"}
+        return {
+            "loss": loss.item(),
+            "kl_loss": kl_loss.item(),
+            "hard_loss": hard_loss.item(),
+            "phase": "speculative",
+        }
 
     # ---- Full training loop ----
 
