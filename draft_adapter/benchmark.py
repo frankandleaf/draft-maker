@@ -1,35 +1,78 @@
-"""Native speculative decoding benchmark — no vLLM dependency.
+"""Native autoregressive speculative-decoding benchmark.
 
-Verifies the draft model by running actual speculative decoding:
-  1. Draft model proposes K tokens autoregressively (fast, small model)
-  2. Target model verifies all K tokens in one forward pass (slow, big model)
-  3. Count accepted tokens → acceptance rate
+The draft model proposes tokens one at a time using its own KV cache.  The
+target model verifies a whole proposed block in one batched forward pass.
+That target pass is not an implementation accident: exact speculative
+decoding needs the target distribution at every proposed position.  The
+optimization is that K positions are verified together, replacing K separate
+target decoding steps with one forward pass.
 
-Reference:
-  Leviathan et al., "Fast Inference from Transformers via Speculative Decoding", ICML 2023.
+This module intentionally keeps the only supported path as a standard
+independent Hugging Face ``AutoModelForCausalLM`` draft.
 """
+
+from __future__ import annotations
 
 import time
 
 import torch
-from torch import Tensor
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
 
-def _validate_draft_model(draft_model, require_svd_hybrid: bool = False) -> None:
-    metadata = getattr(draft_model.config, "_draft_adapter", {})
-    is_svd_hybrid = metadata.get("method") == "svd-hybrid"
-    if require_svd_hybrid and not is_svd_hybrid:
+def _resolve_device(device: str) -> str:
+    """Resolve ``auto`` and fail clearly for an unavailable CUDA device."""
+    if device in ("", "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "Draft model is not an SVD-hybrid export; regenerate it with "
-            "--method svd-hybrid"
+            f"Requested device {device!r}, but torch.cuda.is_available() is False"
         )
-    if is_svd_hybrid and draft_model.__class__.__name__ != "DraftQwen3ForCausalLM":
-        raise RuntimeError(
-            "SVD-hybrid draft loaded with "
-            f"{draft_model.__class__.__name__}; expected DraftQwen3ForCausalLM"
+    return str(resolved)
+
+
+def _load_model(model_id: str, device: str):
+    """Load a regular HF CausalLM on one device.
+
+    The benchmark intentionally does not depend on a custom model class or
+    sharding strategy.  ROCm exposes its accelerator through ``cuda`` in
+    PyTorch, while CPU runs use float32 for broad operator compatibility.
+    """
+    dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
         )
+    except (ValueError, KeyError, ImportError):
+        # Gemma 4 IT is packaged as a unified text/vision conditional model,
+        # but its text path exposes the same logits/cache interface needed by
+        # this benchmark.
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        )
+    return model.to(device).eval()
+
+
+def _vocab_size(model) -> int | None:
+    value = getattr(getattr(model, "config", None), "vocab_size", None)
+    return int(value) if value is not None else None
+
+
+def _empty_result() -> dict:
+    return {
+        "generated_text": "",
+        "total_time": 0.0,
+        "tokens_generated": 0,
+        "tokens_accepted": 0,
+        "acceptance_rate": 0.0,
+        "tokens_verified": 0,
+        "num_rounds": 0,
+        "tokens_per_second": 0.0,
+    }
 
 
 @torch.no_grad()
@@ -43,144 +86,217 @@ def speculative_generate(
     temperature: float = 1.0,
     device: str = "cuda",
 ) -> dict:
-    """Run speculative decoding with a target and draft model.
+    """Run exact speculative decoding with persistent KV caches.
 
-    Algorithm:
-      1. Run draft model K steps (autoregressive) to propose K tokens
-      2. Run target model once to verify all K tokens in parallel
-      3. Accept tokens greedily or via rejection sampling
-      4. Repeat until max_new_tokens reached
-
-    Args:
-        target_model: Large target model (teacher).
-        draft_model: Small draft model (student).
-        tokenizer: Shared tokenizer.
-        prompt: Input text.
-        max_new_tokens: Maximum new tokens to generate.
-        num_speculative_tokens: K — tokens proposed per draft round.
-        temperature: Sampling temperature (>0 for sampling, <=0 for greedy).
-        device: Torch device.
-
-    Returns:
-        Dict with: generated_text, total_time, tokens_generated,
-                   tokens_accepted, acceptance_rate, num_rounds
+    In greedy mode a proposed token is accepted iff it equals the target
+    argmax.  For ``temperature > 0`` this uses the standard rejection-sampling
+    correction, so the returned sequence has the same distribution as the
+    target model.  Both caches are cropped after a rejection; the prompt is
+    never recomputed.
     """
     target_model.eval()
     draft_model.eval()
+    device = _resolve_device(device)
+
+    if max_new_tokens <= 0:
+        return _empty_result()
+    K = int(num_speculative_tokens)
+    if K <= 0:
+        raise ValueError("num_speculative_tokens must be positive")
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs.input_ids  # [1, seq_len]
+    input_ids = inputs.input_ids
     prefix_len = input_ids.shape[1]
+    prompt_len = prefix_len
+
+    # Prefill each model exactly once.  Qwen3 uses cache_position together
+    # with DynamicCache; this also works with regular HF cache implementations.
+    prompt_mask = torch.ones_like(input_ids)
+    prompt_pos = torch.arange(prompt_len, device=device)
+    target_state = target_model(
+        input_ids,
+        attention_mask=prompt_mask,
+        use_cache=True,
+        cache_position=prompt_pos,
+    )
+    draft_state = draft_model(
+        input_ids,
+        attention_mask=prompt_mask,
+        use_cache=True,
+        cache_position=prompt_pos,
+    )
+    target_cache = target_state.past_key_values
+    draft_cache = draft_state.past_key_values
+    target_next = target_state.logits[:, -1]
+    draft_next = draft_state.logits[:, -1]
+
+    def append_one(model, cache, token, position):
+        """Advance one model by one committed token without recomputing prefix."""
+        next_len = int(position) + 1
+        mask = torch.ones((1, next_len), dtype=torch.long, device=device)
+        output = model(
+            token.view(1, 1),
+            attention_mask=mask,
+            past_key_values=cache,
+            use_cache=True,
+            cache_position=torch.tensor([position], device=device),
+        )
+        return output.past_key_values, output.logits[:, -1]
 
     tokens_generated = 0
     tokens_accepted = 0
+    tokens_verified = 0
     num_rounds = 0
-    start_time = time.time()
-
-    pbar = tqdm(total=max_new_tokens, desc="Speculative decoding", unit="tok")
-    K = num_speculative_tokens
+    start_time = time.perf_counter()
 
     while tokens_generated < max_new_tokens:
         num_rounds += 1
-        current_len = input_ids.shape[1]
+        round_start = input_ids.shape[1]
+        block_len = min(K, max_new_tokens - tokens_generated)
 
-        # ---- Phase 1: Draft model generates K tokens ----
-        draft_output = draft_model.generate(
-            input_ids,
-            max_new_tokens=K,
-            do_sample=(temperature > 0),
-            temperature=temperature if temperature > 0 else 1.0,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=True,
+        proposed = []
+        proposed_logits = []
+        # The draft remains genuinely autoregressive: each proposal consumes
+        # the previous proposal through its own cache.
+        for offset in range(block_len):
+            proposed_logits.append(draft_next)
+            if temperature <= 0:
+                token = draft_next.argmax(dim=-1, keepdim=True)
+            else:
+                probs = torch.softmax(draft_next.float() / temperature, dim=-1)
+                token = torch.multinomial(probs, 1)
+            proposed.append(token)
+            draft_cache, draft_next = append_one(
+                draft_model,
+                draft_cache,
+                token,
+                round_start + offset,
+            )
+        draft_block = torch.cat(proposed, dim=1)
+
+        # One target forward verifies all K positions in parallel.  This is
+        # the essential speculative-decoding speedup; skipping this full target
+        # computation would no longer guarantee target-equivalent output.
+        verify_mask = torch.ones(
+            (1, round_start + block_len),
+            dtype=torch.long,
+            device=device,
         )
-        draft_ids = draft_output.sequences  # [1, current_len + K]
-        draft_new_ids = draft_ids[0, current_len:]  # [K]
+        verify_pos = torch.arange(
+            round_start,
+            round_start + block_len,
+            device=device,
+        )
+        target_verify = target_model(
+            draft_block,
+            attention_mask=verify_mask,
+            past_key_values=target_cache,
+            use_cache=True,
+            cache_position=verify_pos,
+        )
+        # target_next predicts the first proposed token; each returned logit
+        # then predicts the next token in the proposed block.
+        target_logits = torch.cat(
+            [target_next.unsqueeze(1), target_verify.logits[:, :-1]],
+            dim=1,
+        )
 
-        # ---- Phase 2: Target model verifies all K tokens in one pass ----
-        target_output = target_model(draft_ids)
-        target_logits = target_output.logits  # [1, current_len+K, vocab]
-
-        # Verification: for position p in [current_len, current_len+K-1],
-        # target_logits[0, p-1] gives logits for predicting position p
-        # Verify token at position p using target logits at p-1
-        K_actual = draft_new_ids.shape[0]
         accepted = 0
-
-        for i in range(K_actual):
-            pos = current_len + i  # current position in full sequence
-            logits_at_pos = target_logits[0, pos - 1]  # logits predicting position pos
+        verified = 0
+        replacement = None
+        for index in range(block_len):
+            verified += 1
+            t_logits = target_logits[:, index]
+            draft_token = draft_block[:, index]
 
             if temperature <= 0:
-                # Greedy: accept if draft matches target argmax
-                target_token = logits_at_pos.argmax(dim=-1).item()
-                draft_token = draft_new_ids[i].item()
-                if draft_token == target_token:
+                target_token = t_logits.argmax(dim=-1)
+                if draft_token.item() == target_token.item():
                     accepted += 1
-                    input_ids = torch.cat([input_ids, draft_new_ids[i:i+1].unsqueeze(0)], dim=1)
-                else:
-                    # Reject: use target token instead
-                    input_ids = torch.cat([
-                        input_ids,
-                        torch.tensor([[target_token]], device=device)
-                    ], dim=1)
-                    accepted += 0  # draft token was rejected
-                    break  # Stop verification chain
-            else:
-                # Rejection sampling (Leviathan et al. 2023, Algorithm 2)
-                probs_t = torch.softmax(logits_at_pos / temperature, dim=-1)
-                probs_d = torch.softmax(
-                    draft_output.scores[i][0] / temperature, dim=-1
-                )
-                draft_token = draft_new_ids[i].item()
+                    continue
+                replacement = target_token
+                break
 
-                # Accept with probability min(1, p_t(x) / p_d(x))
-                p_t = probs_t[draft_token].item()
-                p_d = probs_d[draft_token].item()
-                accept_prob = min(1.0, p_t / p_d) if p_d > 0 else 0.0
+            t_probs = torch.softmax(t_logits.float() / temperature, dim=-1)
+            d_probs = torch.softmax(
+                proposed_logits[index].float() / temperature,
+                dim=-1,
+            )
+            p_t = t_probs.gather(-1, draft_token.view(1, 1)).item()
+            p_d = d_probs.gather(-1, draft_token.view(1, 1)).item()
+            accept_prob = min(1.0, p_t / p_d) if p_d > 0 else 0.0
+            if torch.rand((), device=device).item() < accept_prob:
+                accepted += 1
+                continue
 
-                if torch.rand(1).item() < accept_prob:
-                    accepted += 1
-                    input_ids = torch.cat([input_ids, draft_new_ids[i:i+1].unsqueeze(0)], dim=1)
-                else:
-                    # Reject: sample from residual distribution
-                    residual = torch.clamp(probs_t - probs_d, min=0)
-                    residual_sum = residual.sum()
-                    if residual_sum > 0:
-                        residual = residual / residual_sum
-                        target_token = torch.multinomial(residual, 1).item()
-                    else:
-                        target_token = probs_t.argmax().item()
-                    input_ids = torch.cat([
-                        input_ids,
-                        torch.tensor([[target_token]], device=device)
-                    ], dim=1)
-                    break
+            residual = torch.clamp(t_probs - d_probs, min=0)
+            residual_sum = residual.sum()
+            replacement = (
+                torch.multinomial(residual / residual_sum, 1).view(-1)
+                if residual_sum.item() > 0
+                else t_probs.argmax(dim=-1)
+            )
+            break
 
-        round_generated = input_ids.shape[1] - current_len
-        tokens_generated += round_generated
-        tokens_accepted += accepted
-        pbar.update(round_generated)
+        if replacement is None:
+            # Every draft token survived.  target_verify already contains the
+            # correct cache for the committed block.
+            target_cache = target_verify.past_key_values
+            target_next = target_verify.logits[:, -1]
+            input_ids = torch.cat([input_ids, draft_block], dim=1)
+            tokens_generated += block_len
+            tokens_accepted += accepted
+            tokens_verified += verified
+        else:
+            # Drop target/draft states for the uncommitted suffix and append
+            # the target replacement token to both caches.
+            committed_len = round_start + accepted
+            target_cache.crop(committed_len)
+            draft_cache.crop(committed_len)
+            target_cache, target_next = append_one(
+                target_model,
+                target_cache,
+                replacement,
+                committed_len,
+            )
+            draft_cache, draft_next = append_one(
+                draft_model,
+                draft_cache,
+                replacement,
+                committed_len,
+            )
+            committed = torch.cat(
+                [draft_block[:, :accepted], replacement.view(1, 1)],
+                dim=1,
+            )
+            input_ids = torch.cat([input_ids, committed], dim=1)
+            tokens_generated += committed.shape[1]
+            tokens_accepted += accepted
+            tokens_verified += verified
 
-        # Check EOS
         if input_ids[0, -1].item() == tokenizer.eos_token_id:
             break
 
-    pbar.close()
-    total_time = time.time() - start_time
-    generated_text = tokenizer.decode(
-        input_ids[0, prefix_len:], skip_special_tokens=True
-    )
-
+    total_time = time.perf_counter() - start_time
     return {
-        "generated_text": generated_text,
+        "generated_text": tokenizer.decode(
+            input_ids[0, prefix_len:],
+            skip_special_tokens=True,
+        ),
         "total_time": total_time,
         "tokens_generated": tokens_generated,
         "tokens_accepted": tokens_accepted,
-        "acceptance_rate": tokens_accepted / max(num_rounds * num_speculative_tokens, 1),
+        "acceptance_rate": tokens_accepted / max(tokens_verified, 1),
+        "tokens_verified": tokens_verified,
         "num_rounds": num_rounds,
-        "tokens_per_second": tokens_generated / total_time if total_time > 0 else 0,
+        "tokens_per_second": (
+            tokens_generated / total_time if total_time > 0 else 0.0
+        ),
     }
+
+
+# Backward-compatible name used by earlier scripts.
+speculative_generate_kvcache = speculative_generate
 
 
 def benchmark_speculative(
@@ -190,76 +306,87 @@ def benchmark_speculative(
     max_new_tokens: int = 128,
     num_speculative_tokens: int = 5,
     temperature: float = 0.0,
-    device: str = "cuda",
-    require_svd_hybrid: bool = False,
+    device: str = "auto",
 ) -> dict:
-    """Run speculative decoding benchmark comparing target-only vs speculative.
-
-    Returns:
-        Dict with aggregated results and per-prompt details.
-    """
-    target = AutoModelForCausalLM.from_pretrained(
-        target_model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-        trust_remote_code=True,
-    )
-    draft = AutoModelForCausalLM.from_pretrained(
-        draft_model_path,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-        trust_remote_code=True,
-    )
-    _validate_draft_model(draft, require_svd_hybrid=require_svd_hybrid)
+    """Compare an independent draft model against a target model."""
+    device = _resolve_device(device)
+    target = _load_model(target_model_id, device)
+    draft = _load_model(draft_model_path, device)
+    target_vocab = _vocab_size(target)
+    draft_vocab = _vocab_size(draft)
+    if (
+        target_vocab is not None
+        and draft_vocab is not None
+        and target_vocab != draft_vocab
+    ):
+        raise ValueError(
+            "Target and draft must currently use the same vocabulary size "
+            f"(target={target_vocab}, draft={draft_vocab}). "
+            "Vocabulary alignment is a future research milestone."
+        )
     tokenizer = AutoTokenizer.from_pretrained(draft_model_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Target model: {sum(p.numel() for p in target.parameters())/1e9:.2f}B params")
-    print(f"Draft model:  {sum(p.numel() for p in draft.parameters())/1e6:.1f}M params")
-    print(f"Prompts: {len(prompts)}, Spec tokens: {num_speculative_tokens}, "
-          f"Temp: {temperature}, Max new: {max_new_tokens}\n")
+    print(
+        f"Target model: "
+        f"{sum(p.numel() for p in target.parameters()) / 1e9:.2f}B params"
+    )
+    print(
+        f"Draft model: "
+        f"{sum(p.numel() for p in draft.parameters()) / 1e6:.1f}M params"
+    )
+    print(
+        f"Prompts: {len(prompts)}, Spec tokens: {num_speculative_tokens}, "
+        f"Temp: {temperature}, Max new: {max_new_tokens}\n"
+    )
 
-    all_results = []
+    results = []
     total_accepted = 0
+    total_verified = 0
     total_rounds = 0
-    total_time = 0
+    total_time = 0.0
     total_tokens = 0
 
-    for i, prompt in enumerate(prompts):
-        print(f"[{i+1}/{len(prompts)}] {prompt[:60]}...")
+    for index, prompt in enumerate(prompts):
+        print(f"[{index + 1}/{len(prompts)}] {prompt[:60]}...")
         result = speculative_generate(
-            target, draft, tokenizer, prompt,
+            target,
+            draft,
+            tokenizer,
+            prompt,
             max_new_tokens=max_new_tokens,
             num_speculative_tokens=num_speculative_tokens,
             temperature=temperature,
             device=device,
         )
-        all_results.append(result)
+        results.append(result)
         total_accepted += result["tokens_accepted"]
+        total_verified += result["tokens_verified"]
         total_rounds += result["num_rounds"]
         total_time += result["total_time"]
         total_tokens += result["tokens_generated"]
+        print(
+            f"  Speed: {result['tokens_per_second']:.1f} tok/s, "
+            f"Accept: {result['acceptance_rate']:.1%}, "
+            f"Generated: {result['tokens_generated']} tokens\n"
+        )
 
-        print(f"  Speed: {result['tokens_per_second']:.1f} tok/s, "
-              f"Accept: {result['acceptance_rate']:.1%}, "
-              f"Generated: {result['tokens_generated']} tokens\n")
-
-    avg_acceptance = total_accepted / max(total_rounds * num_speculative_tokens, 1)
-    avg_tps = total_tokens / total_time if total_time > 0 else 0
-
-    print(f"{'='*60}")
+    avg_acceptance = total_accepted / max(total_verified, 1)
+    avg_tps = total_tokens / total_time if total_time > 0 else 0.0
+    print("=" * 60)
     print(f"Summary over {len(prompts)} prompts:")
     print(f"  Total tokens generated: {total_tokens}")
     print(f"  Total rounds: {total_rounds}")
     print(f"  Acceptance rate: {avg_acceptance:.1%}")
     print(f"  Average throughput: {avg_tps:.1f} tok/s")
     print(f"  Total time: {total_time:.1f}s")
-    print(f"{'='*60}")
+    print("=" * 60)
 
     return {
         "acceptance_rate": avg_acceptance,
         "tokens_per_second": avg_tps,
         "total_tokens": total_tokens,
         "total_rounds": total_rounds,
+        "results": results,
     }

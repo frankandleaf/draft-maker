@@ -1,93 +1,100 @@
 # Draft-Adapter
 
-Turn standard Hugging Face LLMs into vLLM-compatible draft models for speculative decoding — with a single command.
+Draft-Adapter is a small, measurement-first project for speculative
+decoding. The current supported path is deliberately narrow:
 
-Given any GQA decoder model (Llama, Qwen3, Mistral, Gemma2), Draft-Adapter automatically produces a compact draft model via width compression, depth pruning, and on-policy distillation. The output is a standard HF-format model that plugs directly into vLLM's `speculative_model` parameter.
+```text
+independent Hugging Face CausalLM draft
+        ↓
+exact autoregressive speculative decoding
+        ↓
+acceptance + end-to-end throughput measurement
+```
 
-Default factors (hd=0.5, hs=0.5, es=0.5, ls=0.75) produce a draft ~10% the size of the original.
+The repository previously contained SliceGPT, Swift-SVD, structural layer
+pruning, EAGLE3, Medusa and MTP prototypes. Those branches did not produce a
+reliable, portable speedup on the target setup, so they have been removed
+from the active codebase. In particular, an acceptance rate without a wall
+clock speedup is not considered a successful draft.
 
-## Quick Start
+## What works today
+
+- Load any compatible target and independent draft through
+  `AutoModelForCausalLM`.
+- Run on CPU or CUDA/ROCm with `--device auto`; the current benchmark requires
+  the target and draft to have the same vocabulary size.
+- Run exact greedy or rejection-sampling speculative decoding with persistent
+  KV caches.
+- Report acceptance rate, verified tokens, rounds and tokens/second.
+- Keep the draft as a normal HF CausalLM, so it remains usable by standard
+  speculative-decoding runtimes such as vLLM and llama.cpp-compatible
+  workflows.
+- Retain two standalone research scripts for reproducing the existing
+  teacher-self-distillation and acceptance-aware baselines.
+
+## Benchmark
 
 ```bash
-# Install
-pip install -e .
-
-# Generate a draft model from Qwen3-1.7B
-draft-adapter --model Qwen/Qwen3-1.7B --output ./draft_qwen
-
-# With distillation for better acceptance rate
-draft-adapter --model Qwen/Qwen3-1.7B --output ./draft_qwen --distill
-
-# Use the draft model with vLLM
-python -c "
-from vllm import LLM
-llm = LLM(model='Qwen/Qwen3-1.7B', speculative_model='./draft_qwen')
-"
+draft-adapter \
+  --target Qwen/Qwen3-1.7B \
+  --draft ./draft_qwen \
+  --prompt "Explain speculative decoding in one paragraph." \
+  --prompt "用中文解释 KV cache。" \
+  --max-new-tokens 128 \
+  --speculative-tokens 5 \
+  --temperature 0
 ```
 
-## Pipeline
+The benchmark reports acceptance and throughput separately. A high acceptance
+rate can still be slower when target and draft compete for the same device;
+both numbers must be evaluated.
 
+## Current baseline
+
+The best validated local baseline is an independently trained Qwen3 draft
+with approximately 86–87% aggregate acceptance under greedy decoding. On the
+shared CPU/accelerator setup it did not yet provide end-to-end acceleration,
+which is why the next milestone is runtime-aware rather than another
+compression recipe.
+
+## Next milestone: vocabulary alignment
+
+The next implementation will focus on a model-agnostic vocabulary bridge:
+
+1. map tokens between different tokenizer vocabularies;
+2. initialize the bridge from existing embeddings/logits;
+3. train only a small adapter, ideally with zero target examples;
+4. optionally perform a very short online calibration pass;
+5. optimize for accepted tokens per target forward, not language-model
+   perplexity alone.
+
+The target is roughly 90% greedy acceptance and 1.5–2× end-to-end speedup,
+but those are goals to validate, not claims about the current release.
+
+An initial offline converter is now available for experiments:
+
+```bash
+python scripts/unified_vocab_distill.py \
+  --target <target-model-or-cache-path> \
+  --student <small-causal-lm-or-cache-path> \
+  --output ./runs/unified-draft \
+  --analyze-only
 ```
-Original Model (HF)
-    │
-    ├── [1] inspect     — Architecture detection, target dimension computation
-    ├── [2] calibrate   — Swift-SVD incremental covariance aggregation
-    ├── [3] compress    — SliceGPT global PCA projection + width slicing
-    ├── [4] prune       — ShortGPT Block Influence (BI) layer ranking
-    ├── [5] distill     — DistillSpec on-policy top-K KL (optional)
-    └── [6] export      — HF-format draft model (config.json + safetensors)
-```
 
-## Parameters
+It uses the target tokenizer as the canonical vocabulary, initializes exact
+and decomposable rows from the student tokenizer, keeps special tokens as
+trainable anchors, and exports a standard HF CausalLM checkpoint. The
+four-stage training path is intentionally experimental and must be measured
+on the target hardware before being treated as a usable draft.
 
-| Flag | Range | Description |
-|------|-------|-------------|
-| `--hd` | (0, 1] | Head dimension multiplier |
-| `--hs` | (0, 1] | Head count multiplier (affects both Q and KV heads) |
-| `--es` | (0, 1] | Embed dimension multiplier |
-| `--ls` | (0, 1] | Layer count multiplier |
-| `--distill` | flag | Enable on-policy distillation |
-| `--kl-mode` | reverse/forward/tvd | KL divergence type for distillation |
+## Deliberately out of scope
 
-## Technical Details
+This repository does not currently ship structural width/depth compression,
+SVD factorization, EAGLE3 sidecars, Medusa heads, native MTP stitching, a
+calibration-data pipeline, or a custom inference runtime. Those approaches
+require separate, verified runtime support and will only return if they
+demonstrate a portable speedup.
 
-### Width Compression (SliceGPT)
-
-We compute a global PCA projection matrix Q from calibration data, then apply it to all weight matrices. Unlike naive dimension slicing, the PCA rotation ensures we delete only the *least important* principal components.
-
-For weights interacting with the residual stream:
-- **Both-side projection** (`q_proj`, `o_proj`): W' = Q_top.T @ W @ Q_top
-- **Input-side** (`k_proj`, `v_proj`, `gate_proj`, `up_proj`): W' = W @ Q_top
-- **Output-side** (`down_proj`): W' = Q_top.T @ W
-- **Embeddings** (`embed_tokens`, `lm_head`): W' = W @ Q_top
-
-### Depth Pruning (ShortGPT)
-
-Block Influence (BI) measures how much each layer transforms hidden states:
-BI_i = 1 - mean(cos_sim(X_i, X_{i+1})). Lower BI = more redundant. First and last layers are always protected.
-
-### Distillation (DistillSpec)
-
-On-policy distillation: the student (draft) generates tokens, the teacher scores them. Top-K sparse KL divergence prevents the student from wasting capacity on near-zero teacher logits.
-
-## Supported Models
-
-| Family | Model Type | Status |
-|--------|------------|--------|
-| Llama 2/3/4 | `llama` | Supported |
-| Qwen2 / Qwen2.5 | `qwen2` | Supported |
-| Qwen3 | `qwen3` | Supported |
-| Mistral | `mistral` | Supported |
-| Gemma 2 | `gemma2` | Supported |
-| StableLM | `stablelm` | Supported |
-| MoE variants | — | Not supported |
-| MLA (DeepSeek) | — | Not supported |
-| Mamba (SSM) | — | Not supported |
-
-## References
-
-- [SliceGPT: Compress Large Language Models by Deleting Rows and Columns](https://arxiv.org/abs/2401.15024) — Ashkboos et al., ICLR 2024
-- [ShortGPT: Layers in Large Language Models are More Redundant Than You Expect](https://arxiv.org/abs/2403.03853) — Men et al., 2024
-- [DistillSpec: Improving Speculative Decoding via Knowledge Distillation](https://arxiv.org/abs/2310.08461) — Zhou et al., ICLR 2024
-- [AdaSPEC: Selective Knowledge Distillation for Efficient Speculative Decoders](https://arxiv.org/abs/2510.19779) — Hu et al., NeurIPS 2025
-- [Swift-SVD: Theoretical Optimality Meets Practical Efficiency in Low-Rank LLM Compression](https://arxiv.org/abs/2604.01609) — Qi et al., ICML 2026
+The scripts `scripts/teacher_self_distill.py` and
+`scripts/on_policy_acceptance_distill.py` are retained as reproducible
+baselines, not as the public model-construction API.

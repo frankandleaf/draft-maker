@@ -1,4 +1,3 @@
-import torch
 from draft_adapter.benchmark import benchmark_speculative
 
 PROMPTS = [
@@ -17,7 +16,6 @@ def main():
         max_new_tokens=128,
         num_speculative_tokens=5,
         temperature=0.0,
-        require_svd_hybrid=True,
     )
 
 

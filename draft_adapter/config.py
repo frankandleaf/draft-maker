@@ -1,79 +1,15 @@
-"""Configuration dataclasses for the Draft-Adapter pipeline."""
+"""Configuration for the small utilities retained in Draft-Adapter."""
 
-from dataclasses import dataclass, field
-
-
-@dataclass
-class WidthConfig:
-    """Width compression factors (0.0–1.0 multipliers).
-
-    head_dim is FROZEN — changing it breaks RoPE position encoding.
-    Width reduction is absorbed entirely by num_heads.
-
-    Attributes:
-        head_dim_factor: (DEPRECATED, kept for CLI compat) Ignored.
-        head_size_factor: Scales num_heads (and num_kv_heads for GQA).
-        embed_size_factor: Scales hidden_size / embed_dim.
-        calibration_samples: Number of calibration sequences for PCA.
-        calibration_seq_len: Max tokens per calibration sequence.
-        rank_factor: Rank retained by SVD-hybrid projection decomposition.
-    """
-
-    head_dim_factor: float = 0.5   # DEPRECATED: head_dim is frozen
-    head_size_factor: float = 0.5
-    embed_size_factor: float = 0.5
-    calibration_samples: int = 16
-    calibration_seq_len: int = 512
-    rank_factor: float = 0.5
-
-    def __post_init__(self):
-        for name in (
-            "head_dim_factor",
-            "head_size_factor",
-            "embed_size_factor",
-            "rank_factor",
-        ):
-            v = getattr(self, name)
-            if not 0 < v <= 1:
-                raise ValueError(f"{name} must be in (0, 1], got {v}")
-
-
-@dataclass
-class DepthConfig:
-    """Depth pruning parameters.
-
-    Attributes:
-        layer_factor: Fraction of layers to keep. Range (0, 1].
-        protect_first: Number of initial layers always kept.
-        protect_last: Number of final layers always kept.
-    """
-
-    layer_factor: float = 0.75  # hd*hs*es*ls = 0.5*0.5*0.5*0.75 ≈ 0.094 → ~9.4%
-    protect_first: int = 1
-    protect_last: int = 1
-
-    def __post_init__(self):
-        if not 0 < self.layer_factor <= 1:
-            raise ValueError(f"layer_factor must be in (0, 1], got {self.layer_factor}")
-        if self.protect_first < 0 or self.protect_last < 0:
-            raise ValueError("protect_first and protect_last must be >= 0")
+from dataclasses import dataclass
 
 
 @dataclass
 class DistillConfig:
-    """Distillation hyperparameters.
+    """Experimental settings for the retained distillation scripts.
 
-    Attributes:
-        steps: Number of training steps.
-        batch_size: Batch size per step.
-        max_seq_len: Maximum sequence length for on-policy generation.
-        learning_rate: AdamW learning rate.
-        top_k: Top-K for sparse KL divergence.
-        kl_temperature: Temperature for softening logits.
-        kl_mode: "reverse", "forward", or "tvd".
-        hard_label_weight: Weight for teacher-argmax cross entropy.
-        num_train_prompts: Number of training prompts.
-        generate_len: Number of tokens student generates per step.
+    This dataclass is kept for configuration compatibility with old research
+    notebooks.  It is not used by the benchmark or CLI and is intentionally
+    not a model-generation pipeline.
     """
 
     steps: int = 4000
@@ -87,54 +23,16 @@ class DistillConfig:
     num_train_prompts: int = 128
     generate_len: int = 32
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.kl_mode not in ("reverse", "forward", "tvd"):
-            raise ValueError(f"kl_mode must be 'reverse', 'forward', or 'tvd', got {self.kl_mode}")
+            raise ValueError(
+                "kl_mode must be 'reverse', 'forward', or 'tvd', "
+                f"got {self.kl_mode}"
+            )
         if self.top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {self.top_k}")
         if self.hard_label_weight < 0:
             raise ValueError(
-                "hard_label_weight must be >= 0, got "
-                f"{self.hard_label_weight}"
-            )
-
-
-@dataclass
-class PipelineConfig:
-    """Top-level pipeline configuration.
-
-    Attributes:
-        model: HuggingFace model ID or local path.
-        tokenizer: HuggingFace tokenizer ID (defaults to model).
-        output: Output directory for the draft model.
-        device: Torch device string.
-        dtype: Model dtype string.
-        seed: Random seed for reproducibility.
-        width: Width compression config.
-        depth: Depth pruning config.
-        distill: Distillation config (None = use defaults if --distill).
-        skip_distill: Skip the distillation step.
-        skip_benchmark: Skip the vLLM benchmark step.
-    """
-
-    model: str
-    tokenizer: str | None = None
-    output: str = "./draft_model"
-    device: str = "cuda"
-    dtype: str = "bfloat16"
-    seed: int = 42
-    width: WidthConfig = field(default_factory=WidthConfig)
-    depth: DepthConfig = field(default_factory=DepthConfig)
-    distill: DistillConfig | None = None
-    skip_distill: bool = False
-    skip_benchmark: bool = False
-    debug: bool = False
-    method: str = "slicegpt"
-
-    def __post_init__(self):
-        if self.tokenizer is None:
-            self.tokenizer = self.model
-        if self.method not in ("slicegpt", "svd-hybrid"):
-            raise ValueError(
-                f"method must be 'slicegpt' or 'svd-hybrid', got {self.method}"
+                "hard_label_weight must be >= 0, "
+                f"got {self.hard_label_weight}"
             )

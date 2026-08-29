@@ -135,7 +135,11 @@ celerybeat.pid
 *.rdb
 *.aof
 *.pid
-draft_qwen3/
+# Local model checkpoints and experiment outputs
+draft_qwen*/
+models/
+runs/
+gpucore.*
 # RabbitMQ
 mnesia/
 rabbitmq/

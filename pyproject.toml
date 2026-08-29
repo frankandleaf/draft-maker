@@ -3,15 +3,15 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "draft-adapter"
-version = "0.1.0"
-description = "Turn standard LLMs into vLLM-compatible draft models for speculative decoding"
+version = "0.2.0"
+description = "Measure independent CausalLM drafts for speculative decoding"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Frank", email = "frank@example.com"},
 ]
-keywords = ["llm", "speculative-decoding", "draft-model", "model-compression", "vllm"]
+keywords = ["llm", "speculative-decoding", "draft-model", "vllm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

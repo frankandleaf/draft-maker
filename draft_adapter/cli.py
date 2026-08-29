@@ -1,376 +1,58 @@
-"""CLI entry point and pipeline orchestration.
+"""Small command-line surface for the currently supported baseline.
 
-Usage:
-    draft-adapter --model Qwen/Qwen3-1.7B \\
-        --hd 0.75 --hs 0.75 --es 0.5 --ls 0.75 \\
-        --output ./draft_model --distill
+Draft generation by structural compression was removed from this package.
+The next implementation target is a vocabulary-alignment adapter trained
+without calibration data.  Until that adapter lands, this CLI only exposes
+the reproducible speculative-decoding benchmark.
 """
+
+from __future__ import annotations
 
 import argparse
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from transformers import AutoConfig
-
 from . import __version__
-from .calibration import compute_global_covariance
-from .compress import WidthCompressor, verify_residual_consistency
-from .compress_ffn import SwiftSVDCompressor
-from .compress_svd import SVDCompressor, SVDDecomposer
-from .config import DepthConfig, DistillConfig, PipelineConfig, WidthConfig
-from .debug_log import enable_debug, get_logger
-from .distill import DistillationTrainer
-from .export import export_svd_hybrid_to_hf, export_to_hf
-from .inspect import compute_targets, inspect_model
-from .prune import DepthPruner
-from .utils import (
-    count_parameters,
-    format_param_count,
-    get_dtype,
-    load_calibration_data,
-    set_seed,
-)
+from .benchmark import benchmark_speculative
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
-    p = argparse.ArgumentParser(
-        "draft-adapter",
-        description="Turn standard LLMs into vLLM-compatible draft models.",
+    parser = argparse.ArgumentParser(
+        prog="draft-adapter",
+        description=(
+            "Benchmark an independent Hugging Face CausalLM draft against a "
+            "target model."
+        ),
     )
-    p.add_argument("--version", action="version",
-                   version=f"draft-adapter {__version__}")
-
-    # Model
-    p.add_argument("--model", required=True,
-                   help="HF model ID or local path")
-    p.add_argument("--tokenizer", default=None,
-                   help="Tokenizer (defaults to model)")
-    p.add_argument("--output", default="./draft_model",
-                   help="Output directory for the draft model")
-    p.add_argument("--device", default="cuda",
-                   help="Torch device")
-    p.add_argument("--dtype", default="bfloat16",
-                   choices=["float32", "float16", "bfloat16"])
-    p.add_argument("--seed", type=int, default=42)
-
-    p.add_argument("--method", default="slicegpt",
-                   choices=["slicegpt", "svd-hybrid"],
-                   help="Compression algorithm")
-
-    # Width compression (hd, hs, es)
-    p.add_argument("--hd", type=float, default=0.5,
-                   help="Head dim multiplier (0-1]")
-    p.add_argument("--hs", type=float, default=0.5,
-                   help="Head count multiplier (0-1]")
-    p.add_argument("--es", type=float, default=0.5,
-                   help="Embed size multiplier (0-1]")
-    p.add_argument("--calibration-samples", type=int, default=16,
-                   help="Number of calibration sequences for PCA")
-    p.add_argument("--rank-factor", type=float, default=0.5,
-                   help="SVD rank factor for svd-hybrid (0-1]")
-
-    # Depth pruning (ls)
-    p.add_argument("--ls", type=float, default=0.75,
-                   help="Layer count multiplier (0-1]")
-    p.add_argument("--protect-first", type=int, default=1,
-                   help="Always keep first N layers")
-    p.add_argument("--protect-last", type=int, default=1,
-                   help="Always keep last N layers")
-
-    # Distillation
-    p.add_argument("--distill", action="store_true",
-                   help="Run on-policy distillation")
-    p.add_argument("--distill-steps", type=int, default=1000,
-                   help="Number of distillation steps")
-    p.add_argument("--distill-lr", type=float, default=1e-5,
-                   help="Distillation learning rate")
-    p.add_argument("--distill-batch", type=int, default=4,
-                   help="Distillation batch size")
-    p.add_argument("--distill-prompts", type=int, default=128,
-                   help="Number of training prompt sequences")
-    p.add_argument("--distill-seq-len", type=int, default=512,
-                   help="Tokens per distillation sequence")
-    p.add_argument("--kl-top-k", type=int, default=10,
-                   help="Top-K for sparse KL divergence")
-    p.add_argument("--kl-mode", default="reverse",
-                   choices=["reverse", "forward", "tvd"],
-                   help="KL divergence mode")
-    p.add_argument("--kl-temperature", type=float, default=1.0,
-                   help="Temperature for KL divergence")
-    p.add_argument("--hard-label-weight", type=float, default=1.0,
-                   help="Teacher-argmax CE weight during on-policy distillation")
-    p.add_argument("--distill-gen-len", type=int, default=32,
-                   help="Tokens student generates per step")
-
-    # Pipeline control
-    p.add_argument("--debug", action="store_true",
-                   help="Print detailed debug info for every weight operation")
-    p.add_argument("--skip-distill", action="store_true",
-                   help="Skip distillation (combine with --distill to undo)")
-    p.add_argument("--skip-benchmark", action="store_true",
-                   help="Skip vLLM benchmark")
-
-    return p
-
-
-def run_pipeline(config: PipelineConfig) -> None:
-    """Execute the full draft-adapter pipeline."""
-    set_seed(config.seed)
-    if config.debug:
-        enable_debug()
-    log = get_logger()
-
-    # ============================================================
-    # STEP 0: Load config (lightweight — no model weights)
-    # ============================================================
-    original_config = AutoConfig.from_pretrained(
-        config.model, trust_remote_code=True,
+    parser.add_argument("--version", action="version", version=f"draft-adapter {__version__}")
+    parser.add_argument("--target", required=True, help="Target model ID or local path")
+    parser.add_argument("--draft", required=True, help="Independent draft model path")
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        required=True,
+        help="Prompt to benchmark; repeat for multiple prompts",
     )
-
-    # ============================================================
-    # STEP 1/6: Inspect model architecture
-    # ============================================================
-    print("\n[1/6] Inspecting model architecture...")
-    arch = inspect_model(config.model)
-    arch = compute_targets(arch, config.width, config.depth)
-    if config.method == "svd-hybrid":
-        groups = arch.num_kv_groups
-        arch.target_embed_dim = arch.hidden_size
-        arch.target_num_heads = max(
-            groups,
-            int(arch.num_attention_heads * config.width.head_size_factor),
-        )
-        arch.target_num_heads = (arch.target_num_heads // groups) * groups
-        arch.target_num_kv_heads = arch.target_num_heads // groups
-        arch.target_intermediate_size = max(
-            8,
-            int(arch.intermediate_size * config.width.embed_size_factor),
-        )
-
-    print(f"  Model type: {arch.model_type}")
-    print(f"  Original: {arch.num_layers}L, {arch.hidden_size}d, "
-          f"{arch.num_attention_heads}H/{arch.num_kv_heads}KV, "
-          f"{arch.head_dim}hd, {arch.intermediate_size}FFN")
-    print(f"  Target:   {arch.target_num_layers}L, {arch.target_embed_dim}d, "
-          f"{arch.target_num_heads}H/{arch.target_num_kv_heads}KV, "
-          f"{arch.target_head_dim}hd, {arch.target_intermediate_size}FFN")
-    print(f"  GQA groups: {arch.num_kv_groups} → "
-          f"{arch.target_num_heads // arch.target_num_kv_heads} "
-          f"(heads/kv={arch.target_num_heads}/{arch.target_num_kv_heads})")
-
-    # ============================================================
-    # STEP 2/6: Load model + calibration → covariance
-    # ============================================================
-    print("\n[2/6] Loading model and computing covariance...")
-    dtype = get_dtype(config.dtype)
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.tokenizer or config.model,
-        trust_remote_code=True,
-        padding_side="left",
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--speculative-tokens", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device for both models: auto, cpu, cuda, or cuda:N (default: auto)",
     )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model,
-        torch_dtype=dtype,
-        device_map=config.device,
-        trust_remote_code=True,
-    )
-    model.eval()
-    params = count_parameters(model)
-    print(f"  Teacher model: {format_param_count(params['total'])} parameters")
-
-    # Load calibration data
-    calib_ids = load_calibration_data(
-        tokenizer,
-        num_samples=config.width.calibration_samples,
-        seq_len=config.width.calibration_seq_len,
-        device=config.device,
-    )
-    print(f"  Calibration data: {calib_ids.shape[0]} seqs x "
-          f"{calib_ids.shape[1]} tokens")
-
-    if config.method == "svd-hybrid":
-        print("\n[2b/6] Scoring attention heads and FFN neurons...")
-        compressor = SwiftSVDCompressor(arch)
-        compressor.compute_head_importance(model, calib_ids)
-        compressor.compute_ffn_importance(model, calib_ids)
-        print("\n[3/6] Importance-aware head and FFN pruning...")
-        compressed_model, _ = compressor.prune(model, original_config)
-    else:
-        print("  Computing global covariance matrix...")
-        aggregator = compute_global_covariance(
-            model, calib_ids,
-            chunk_size=4,
-        )
-        covariance = aggregator.compute()
-        print(f"  Covariance matrix: {covariance.shape} (conditioning...)")
-
-        print("\n[3/6] Width compression (global SliceGPT)...")
-        compressor = WidthCompressor(arch, covariance=covariance)
-        compressor.compute_projection()
-        compressed_model, _ = compressor.compress(model, original_config)
-
-    compressed_model = compressed_model.to(config.device)
-    params = count_parameters(compressed_model)
-    print(f"  Compressed model: {format_param_count(params['total'])} parameters")
-
-    # Verify residual stream consistency
-    print("  Verifying residual stream consistency...")
-    verify_residual_consistency(compressed_model, tokenizer, config.device)
-    print("  Residual stream consistency: OK")
-
-    # ============================================================
-    # STEP 4/6: Depth pruning (ShortGPT)
-    # ============================================================
-    print("\n[4/6] Depth pruning (ShortGPT BI)...")
-    pruner = DepthPruner(
-        arch,
-        protect_first=config.depth.protect_first,
-        protect_last=config.depth.protect_last,
-    )
-    bi_scores = pruner.compute_bi_scores(compressed_model, calib_ids)
-
-    # Print BI scores
-    score_str = ", ".join(f"L{i}:{s:.4f}" for i, s in enumerate(bi_scores))
-    print(f"  BI scores: [{score_str}]")
-
-    keep_indices = pruner.select_layers(arch.target_num_layers)
-    print(f"  Kept layers: {keep_indices}")
-    print(f"  Removed layers: "
-          f"{[i for i in range(arch.num_layers) if i not in keep_indices]}")
-
-    pruned_model = pruner.prune_model(compressed_model, keep_indices,
-                                       compressed_model.config)
-    pruned_model = pruned_model.to(config.device)
-    params = count_parameters(pruned_model)
-    print(f"  Pruned model: {format_param_count(params['total'])} parameters")
-
-    if config.method == "svd-hybrid" and config.width.rank_factor < 1.0:
-        print(f"\n[4.5/6] SVD projection decomposition "
-              f"(rank_factor={config.width.rank_factor})...")
-        decomposer = SVDDecomposer(rank_factor=config.width.rank_factor)
-        svd_compressor = SVDCompressor(arch, decomposer=decomposer)
-        pruned_model = svd_compressor.decompose_model(pruned_model)
-        params = count_parameters(pruned_model)
-        print(f"  Factorized model: {format_param_count(params['total'])} parameters")
-
-    # ============================================================
-    # STEP 5/6: Distillation (optional)
-    # ============================================================
-    final_model = pruned_model
-
-    if config.distill and not config.skip_distill:
-        print(f"\n[5/6] Distillation (on-policy top-K KL, "
-              f"mode={config.distill.kl_mode})...")
-
-        model = model.to(config.device)
-
-        # Load training data
-        train_ids = load_calibration_data(
-            tokenizer,
-            num_samples=config.distill.num_train_prompts,
-            seq_len=config.distill.max_seq_len,
-            device=config.device,
-        )
-
-        # Teacher is the original model (already loaded)
-        print(f"  Teacher: {format_param_count(count_parameters(model)['total'])} "
-              f"(frozen, inference_mode)")
-        print(f"  Student: {format_param_count(params['total'])} (training)")
-
-        trainer = DistillationTrainer(
-            teacher=model,
-            student=pruned_model,
-            tokenizer=tokenizer,
-            config=config.distill,
-        )
-        final_model = trainer.train(train_ids)
-        print("  Distillation complete.")
-
-    elif config.distill and config.skip_distill:
-        print("\n[5/6] Distillation: skipped (--skip-distill).")
-    else:
-        print("\n[5/6] Distillation: skipped (use --distill to enable).")
-
-    # Clean up teacher to free memory
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ============================================================
-    # STEP 6/6: Export to HF format
-    # ============================================================
-    print("\n[6/6] Exporting draft model to HF format...")
-    if config.method == "svd-hybrid" and config.width.rank_factor < 1.0:
-        export_svd_hybrid_to_hf(
-            final_model, arch, tokenizer, output_dir=config.output,
-        )
-    else:
-        export_to_hf(final_model, arch, tokenizer, output_dir=config.output)
-
-    final_param_count = count_parameters(final_model)['total']
-    print(f"\n{'='*60}")
-    print(f"Done! Draft model saved to {config.output}")
-    print(f"Draft parameters: {format_param_count(final_param_count)}")
-    print(f"{'='*60}")
+    return parser
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-
-    # Build config from CLI args
-    width_cfg = WidthConfig(
-        head_dim_factor=args.hd,
-        head_size_factor=args.hs,
-        embed_size_factor=args.es,
-        calibration_samples=args.calibration_samples,
-        rank_factor=args.rank_factor,
-    )
-
-    depth_cfg = DepthConfig(
-        layer_factor=args.ls,
-        protect_first=args.protect_first,
-        protect_last=args.protect_last,
-    )
-
-    distill_cfg = None
-    if args.distill:
-        distill_cfg = DistillConfig(
-            steps=args.distill_steps,
-            batch_size=args.distill_batch,
-            max_seq_len=args.distill_seq_len,
-            learning_rate=args.distill_lr,
-            top_k=args.kl_top_k,
-            kl_mode=args.kl_mode,
-            kl_temperature=args.kl_temperature,
-            hard_label_weight=args.hard_label_weight,
-            num_train_prompts=args.distill_prompts,
-            generate_len=args.distill_gen_len,
-        )
-
-    config = PipelineConfig(
-        model=args.model,
-        tokenizer=args.tokenizer,
-        output=args.output,
+def main() -> None:
+    args = build_parser().parse_args()
+    benchmark_speculative(
+        target_model_id=args.target,
+        draft_model_path=args.draft,
+        prompts=args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        num_speculative_tokens=args.speculative_tokens,
+        temperature=args.temperature,
         device=args.device,
-        dtype=args.dtype,
-        seed=args.seed,
-        width=width_cfg,
-        depth=depth_cfg,
-        distill=distill_cfg,
-        skip_distill=args.skip_distill or not args.distill,
-        skip_benchmark=args.skip_benchmark,
-        debug=args.debug,
-        method=args.method,
     )
-
-    run_pipeline(config)
 
 
 if __name__ == "__main__":
