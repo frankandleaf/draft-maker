@@ -11,6 +11,30 @@ exact autoregressive speculative decoding
 acceptance + end-to-end throughput measurement
 ```
 
+## Install
+
+Three commands usually get you there:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install <matching-torch-wheel>
+python -m pip install -e .
+```
+
+Use the official PyTorch install command for your backend (CPU, CUDA, or
+ROCm) in place of `<matching-torch-wheel>`. Optional extras:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pip install -e ".[train]"
+python -m pip install -e ".[bench]"
+```
+
+The first benchmark run may still spend most of its time downloading model
+weights from Hugging Face.
+
 The repository previously contained SliceGPT, Swift-SVD, structural layer
 pruning, EAGLE3, Medusa and MTP prototypes. Those branches did not produce a
 reliable, portable speedup on the target setup, so they have been removed
@@ -30,7 +54,14 @@ clock speedup is not considered a successful draft.
   speculative-decoding runtimes such as vLLM and llama.cpp-compatible
   workflows.
 - Retain two standalone research scripts for reproducing the existing
-  teacher-self-distillation and acceptance-aware baselines.
+  teacher-self-distillation and greedy prefix-gated distillation baselines.
+
+The current on-policy training path is deliberately aligned with exact greedy
+speculative decoding: a student proposes a deterministic block, and loss is
+computed only up to the first teacher/student mismatch. Its primary reports
+are mean committed prefix length, target-only throughput, speculative
+throughput, and their speedup. Per-token agreement is retained only as a
+diagnostic.
 
 ## Benchmark
 

@@ -27,15 +27,15 @@ classifiers = [
 dependencies = [
     "torch>=2.4.0",
     "transformers>=4.45.0",
-    "accelerate>=0.33.0",
-    "datasets>=3.0.0",
-    "tqdm>=4.66",
     "safetensors>=0.4.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+]
+train = [
+    "accelerate>=0.33.0",
 ]
 bench = [
     "vllm>=0.6.0",

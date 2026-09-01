@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 
 from . import __version__
-from .benchmark import benchmark_speculative
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Keep ``draft-adapter --help`` and ``--version`` lightweight. PyTorch and
+    # Transformers are imported only after argument parsing because importing
+    # them adds noticeable latency before any model is loaded.
+    from .benchmark import benchmark_speculative
+
     benchmark_speculative(
         target_model_id=args.target,
         draft_model_path=args.draft,

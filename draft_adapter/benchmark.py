@@ -75,12 +75,18 @@ def _empty_result() -> dict:
     }
 
 
+def _sync_if_needed(device: str) -> None:
+    """Make wall-clock measurements include queued CUDA/ROCm work."""
+    if torch.device(device).type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 @torch.no_grad()
 def speculative_generate(
     target_model,
     draft_model,
     tokenizer,
-    prompt: str,
+    prompt: str | torch.Tensor,
     max_new_tokens: int = 128,
     num_speculative_tokens: int = 5,
     temperature: float = 1.0,
@@ -104,13 +110,19 @@ def speculative_generate(
     if K <= 0:
         raise ValueError("num_speculative_tokens must be positive")
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs.input_ids
+    if isinstance(prompt, torch.Tensor):
+        input_ids = prompt.to(device).view(1, -1)
+    else:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        input_ids = inputs.input_ids
     prefix_len = input_ids.shape[1]
     prompt_len = prefix_len
 
-    # Prefill each model exactly once.  Qwen3 uses cache_position together
+    # Include prefill in the wall-clock measurement so this is comparable to
+    # target-only generation. Qwen3 uses cache_position together
     # with DynamicCache; this also works with regular HF cache implementations.
+    _sync_if_needed(device)
+    start_time = time.perf_counter()
     prompt_mask = torch.ones_like(input_ids)
     prompt_pos = torch.arange(prompt_len, device=device)
     target_state = target_model(
@@ -147,8 +159,6 @@ def speculative_generate(
     tokens_accepted = 0
     tokens_verified = 0
     num_rounds = 0
-    start_time = time.perf_counter()
-
     while tokens_generated < max_new_tokens:
         num_rounds += 1
         round_start = input_ids.shape[1]
@@ -277,6 +287,7 @@ def speculative_generate(
         if input_ids[0, -1].item() == tokenizer.eos_token_id:
             break
 
+    _sync_if_needed(device)
     total_time = time.perf_counter() - start_time
     return {
         "generated_text": tokenizer.decode(
